@@ -36,8 +36,9 @@ HEALTH_CHECK_TIMEOUT = 2  # seconds
 # Cache pricing (USD per token) — for delta calculation only
 # Reference: claude-sonnet input = $3.00/MTok
 CACHE_BASE_PRICE_PER_TOKEN = 3.00 / 1_000_000
-CACHE_READ_PRICE_PER_TOKEN = 0.30 / 1_000_000    # 90% savings
-CACHE_CREATE_PRICE_PER_TOKEN = 3.75 / 1_000_000  # 25% surcharge
+CACHE_READ_PRICE_PER_TOKEN = 0.30 / 1_000_000        # 0.1x input
+CACHE_CREATE_5M_PRICE_PER_TOKEN = 3.75 / 1_000_000   # 1.25x input (ephemeral 5m)
+CACHE_CREATE_1H_PRICE_PER_TOKEN = 6.00 / 1_000_000   # 2.0x input (extended 1h)
 TEAM_WINDOW_SECONDS = 300  # seconds gap for concurrent agent detection
 
 
@@ -423,7 +424,9 @@ def update_sidecar(
     cache_1h = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
 
     savings = cache_read * (CACHE_BASE_PRICE_PER_TOKEN - CACHE_READ_PRICE_PER_TOKEN)
-    surcharge = cache_creation * (CACHE_CREATE_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+    surcharge_5m = cache_5m * (CACHE_CREATE_5M_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+    surcharge_1h = cache_1h * (CACHE_CREATE_1H_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+    surcharge = surcharge_5m + surcharge_1h
 
     # Fork cache reuse: at turn 1, compute ratio cache_read / parent total cache
     fork_cache_reuse = None
@@ -775,11 +778,14 @@ def create_trace(
             "cache_5m_input_tokens": usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0),
             "cache_1h_input_tokens": usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0),
         }
+        cache_5m_t = usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
+        cache_1h_t = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
         savings = cache_read * (CACHE_BASE_PRICE_PER_TOKEN - CACHE_READ_PRICE_PER_TOKEN)
-        surcharge = cache_creation * (CACHE_CREATE_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+        surcharge_5m = cache_5m_t * (CACHE_CREATE_5M_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+        surcharge_1h = cache_1h_t * (CACHE_CREATE_1H_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
         cost_details = {
             "cache_savings_usd": round(savings, 6),
-            "cache_surcharge_usd": round(surcharge, 6),
+            "cache_surcharge_usd": round(surcharge_5m + surcharge_1h, 6),
         }
 
     # Create root span (implicitly creates a trace), then set trace-level attributes

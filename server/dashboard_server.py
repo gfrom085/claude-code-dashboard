@@ -8,9 +8,11 @@ Default port: 8765
 """
 
 import json
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 SIDECAR_FILE = Path("/tmp/langfuse-token-metrics.json")
 DASHBOARD_FILE = Path(__file__).parent / "token-dashboard.html"
@@ -156,11 +158,55 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/task-counts":
             self.send_json(scan_task_counts())
 
+        elif path == "/api/cache-audit":
+            self._handle_cache_audit()
+
         elif path == "/api/health":
             self.send_json({"ok": True, "sidecar_exists": SIDECAR_FILE.exists()})
 
         else:
             self.send_json({"error": "not found"}, 404)
+
+    def _handle_cache_audit(self) -> None:
+        """Run cache_audit.py and return results as JSON."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        script = Path(__file__).parent.parent / "scripts" / "cache_audit.py"
+        if not script.exists():
+            self.send_json({"error": "cache_audit.py not found"}, 404)
+            return
+
+        cmd = [sys.executable, str(script), "--no-write"]
+        if "session" in params:
+            cmd.extend(["--session", params["session"][0]])
+        if "project" in params:
+            cmd.extend(["--project", params["project"][0]])
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+            )
+            # Parse JSONL output (stdout lines are JSON objects)
+            events = []
+            metrics = []
+            for line in result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("_type") == "session_metrics":
+                        metrics.append(obj)
+                    else:
+                        events.append(obj)
+                except json.JSONDecodeError:
+                    continue
+
+            self.send_json({"events": events, "metrics": metrics})
+        except subprocess.TimeoutExpired:
+            self.send_json({"error": "cache audit timed out"}, 504)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
 
 
 def main():
