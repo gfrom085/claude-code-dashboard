@@ -1,0 +1,16 @@
+# Runtime state (generated, not source)
+*.log
+langfuse_state.json
+langfuse-token-metrics.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

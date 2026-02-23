@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code — Token Cache Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3e;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --main: #3b82f6;
+    --subagent: #10b981;
+    --fork: #f59e0b;
+    --team: #8b5cf6;
+    --green: #22c55e;
+    --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); transition: background 0.3s;
+  }
+  .status-dot.live { background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .last-updated { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .btn-ghost {
+    background: none; border: 1px solid var(--border); border-radius: 4px;
+    color: var(--muted); padding: 3px 10px; font-size: 11px; cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .btn-ghost:hover { border-color: var(--text); color: var(--text); }
+
+  main { padding: 20px 24px; display: flex; flex-direction: column; gap: 24px; }
+
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .section-header {
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .section-header h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .section-header .count { background: var(--border); padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; color: var(--text); }
+  .section-body { padding: 16px; }
+
+  /* Session cards */
+  .sessions-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .session-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 14px; cursor: pointer; transition: border-color 0.2s;
+    position: relative;
+  }
+  .session-card:hover { border-color: var(--main); }
+  .session-card.selected { border-color: var(--main); box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
+  .session-card.dismissed { opacity: 0.4; filter: grayscale(0.6); }
+  .card-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; gap: 6px; }
+  .btn-dismiss {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 14px; padding: 0 4px; line-height: 1; border-radius: 3px;
+    flex-shrink: 0; transition: color 0.2s, background 0.2s;
+  }
+  .btn-dismiss:hover { color: var(--red); background: rgba(239,68,68,0.1); }
+  .session-id { font-family: monospace; font-size: 12px; color: var(--muted); }
+  .badge {
+    padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .badge-main { background: rgba(59,130,246,0.15); color: var(--main); }
+  .badge-subagent { background: rgba(16,185,129,0.15); color: var(--subagent); }
+  .badge-fork { background: rgba(245,158,11,0.15); color: var(--fork); }
+  .badge-team_agent { background: rgba(139,92,246,0.15); color: var(--team); }
+  .card-project { font-weight: 600; margin-bottom: 8px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card-stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .stat-value { font-size: 13px; font-weight: 600; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.amber { color: var(--fork); }
+  .card-bottom { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .cache-bar { height: 8px; border-radius: 3px; background: var(--border); overflow: hidden; display: flex; cursor: pointer; }
+  .cache-bar-current { height: 12px; border-radius: 4px; }
+  .cache-bar-read { background: var(--green); transition: width 0.4s; }
+  .cache-bar-5m { background: var(--fork); }
+  .cache-bar-1h { background: var(--main); }
+  .cache-bar-input { background: var(--red); }
+  .turn-history { display: flex; flex-direction: column; gap: 4px; }
+  .turn-row { display: flex; align-items: center; gap: 6px; }
+  .turn-time { font-size: 9px; color: var(--muted); width: 36px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .turn-row .cache-bar { flex: 1; }
+  .turn-tasks { font-size: 9px; width: 18px; flex-shrink: 0; text-align: center; color: var(--subagent); font-weight: 700; line-height: 1; }
+  .turn-row.has-agents { border-left: 3px solid var(--subagent); padding-left: 3px; border-radius: 2px; }
+  .turn-row.has-agents .cache-bar { box-shadow: 0 0 4px rgba(16,185,129,0.3); }
+  .bar-labels { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
+  .bar-label { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--muted); }
+  .bar-dot { width: 6px; height: 6px; border-radius: 50%; }
+  #turn-tooltip {
+    position: fixed; z-index: 9999; pointer-events: none;
+    background: #1e2130; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 11px;
+    line-height: 1.7; min-width: 180px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    display: none;
+  }
+  #turn-tooltip .tt-title { font-weight: 600; margin-bottom: 4px; color: var(--text); }
+  #turn-tooltip .tt-row { display: flex; justify-content: space-between; gap: 16px; }
+  #turn-tooltip .tt-label { color: var(--muted); }
+  #turn-tooltip .tt-val { font-weight: 500; }
+  .no-sessions { color: var(--muted); text-align: center; padding: 32px; }
+
+  /* Project groups */
+  .project-group { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 10px; }
+  .project-group:last-child { margin-bottom: 0; }
+  .project-group-header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: rgba(255,255,255,0.02); cursor: pointer; user-select: none;
+    transition: background 0.15s;
+  }
+  .project-group-header:hover { background: rgba(255,255,255,0.05); }
+  .project-group-name { font-weight: 600; font-size: 13px; }
+  .project-group-meta { display: flex; gap: 8px; align-items: center; }
+  .project-group-badge { background: var(--border); padding: 1px 7px; border-radius: 99px; font-size: 11px; color: var(--muted); }
+  .project-group-savings { font-size: 12px; font-weight: 600; color: var(--green); }
+  .project-group-age { font-size: 11px; color: var(--muted); }
+  .project-group-arrow { margin-left: auto; font-size: 10px; color: var(--muted); }
+  .project-group-content { padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+
+  /* Chart section */
+  .chart-controls { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); padding: 5px 10px; font-size: 13px; outline: none;
+    cursor: pointer;
+  }
+  select:focus { border-color: var(--main); }
+  .chart-container { position: relative; height: 280px; }
+
+  /* Race section */
+  .race-group { margin-bottom: 16px; }
+  .race-group:last-child { margin-bottom: 0; }
+  .race-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .race-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .race-label { font-family: monospace; font-size: 11px; color: var(--muted); width: 80px; flex-shrink: 0; }
+  .race-bar-outer { flex: 1; background: var(--border); border-radius: 3px; height: 20px; overflow: hidden; }
+  .race-bar-inner { height: 100%; border-radius: 3px; display: flex; align-items: center; padding: 0 8px; font-size: 11px; font-weight: 600; transition: width 0.4s; white-space: nowrap; }
+  .race-meta { font-size: 11px; color: var(--muted); width: 80px; text-align: right; flex-shrink: 0; }
+
+  /* Cost table */
+  .cost-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .cost-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 14px;
+  }
+  .cost-card-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cost-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .cost-label { font-size: 12px; color: var(--muted); }
+  .cost-value { font-size: 13px; font-weight: 600; }
+  .cost-net { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
+  .cost-bar-wrap { margin-top: 8px; }
+  .cost-bar-outer { background: var(--border); border-radius: 3px; height: 4px; overflow: hidden; }
+  .cost-bar-inner { height: 100%; background: var(--green); border-radius: 3px; }
+  .empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="status-dot" id="dot"></div>
+  <h1>Claude Code — Token Cache Dashboard</h1>
+  <span class="last-updated" id="lastUpdated">—</span>
+</header>
+
+<main>
+
+  <!-- S1: Active Sessions -->
+  <section>
+    <div class="section-header">
+      <h2>Sessions Actives</h2>
+      <span class="count" id="s1count">0</span>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="projectFilter" onchange="renderAll()" style="max-width:200px">
+          <option value="">Tous les projets</option>
+        </select>
+        <select id="windowFilter" onchange="renderAll()">
+          <option value="600">10 min</option>
+          <option value="1800">30 min</option>
+          <option value="3600">1h</option>
+          <option value="7200" selected>2h</option>
+          <option value="86400">24h</option>
+        </select>
+        <span id="dismissedCount" style="font-size:11px;color:var(--muted)"></span>
+        <button class="btn-ghost" id="btnGroup" onclick="toggleGrouping()">Vue plate</button>
+        <button class="btn-ghost" id="toggleDismissed" onclick="toggleShowDismissed()">Afficher archivées</button>
+        <button class="btn-ghost" onclick="clearDismissed()">Tout restaurer</button>
+      </div>
+    </div>
+    <div class="section-body">
+      <div class="sessions-grid" id="sessionGrid">
+        <div class="no-sessions">Chargement...</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- S2: Token Anatomy -->
+  <section>
+    <div class="section-header">
+      <h2>Anatomie Cache par Turn</h2>
+    </div>
+    <div class="section-body">
+      <div class="chart-controls">
+        <select id="sessionSelect"><option value="">— Sélectionner une session —</option></select>
+        <span id="s2meta" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <div class="chart-container">
+        <canvas id="tokenChart"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <!-- S3: Race Detector -->
+  <section>
+    <div class="section-header">
+      <h2>Team Agent Race</h2>
+      <span class="count" id="s3count">0</span>
+    </div>
+    <div class="section-body" id="raceSection">
+      <div class="empty-state">Aucun groupe d'agents concurrent détecté.</div>
+    </div>
+  </section>
+
+  <!-- S4: Cost Trends -->
+  <section>
+    <div class="section-header">
+      <h2>Économies Cache</h2>
+    </div>
+    <div class="section-body">
+      <div class="cost-grid" id="costGrid">
+        <div class="empty-state">Aucune donnée de coût.</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const POLL_INTERVAL = 5000;
+const TEAM_WINDOW = 300;     // seconds — concurrent agent detection
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let sidecar = {};
+let taskCounts = {};   // {session_id: {turn_n: count}}
+let tokenChart = null;
+let selectedSession = null;
+let showDismissed = false;
+let groupByProject = true;  // default: grouped
+const collapsedGroups = new Set();
+const dot = document.getElementById('dot');
+const lastUpdated = document.getElementById('lastUpdated');
+
+// ── Dismiss (archive) ─────────────────────────────────────────────────────────
+const DISMISSED_KEY = 'cc_dashboard_dismissed';
+
+function getDismissed() {
+  try { return new Set(JSON.parse(localStorage.getItem(DISMISSED_KEY) || '[]')); }
+  catch { return new Set(); }
+}
+function saveDismissed(set) {
+  localStorage.setItem(DISMISSED_KEY, JSON.stringify([...set]));
+}
+function dismiss(sid, e) {
+  e.stopPropagation();
+  const d = getDismissed();
+  if (d.has(sid)) { d.delete(sid); } else { d.add(sid); }  // toggle
+  saveDismissed(d);
+  if (!showDismissed && d.has(sid) && selectedSession === sid) { selectedSession = null; }
+  renderSessions();
+  updateSessionSelect();
+  renderChart();
+}
+function clearDismissed() {
+  saveDismissed(new Set());
+  renderSessions();
+  updateSessionSelect();
+}
+function toggleShowDismissed() {
+  showDismissed = !showDismissed;
+  document.getElementById('toggleDismissed').textContent =
+    showDismissed ? 'Masquer archivées' : 'Afficher archivées';
+  renderSessions();
+}
+
+function toggleGrouping() {
+  groupByProject = !groupByProject;
+  document.getElementById('btnGroup').textContent =
+    groupByProject ? 'Vue plate' : 'Par projet';
+  renderSessions();
+}
+
+function toggleGroup(proj) {
+  if (collapsedGroups.has(proj)) { collapsedGroups.delete(proj); }
+  else { collapsedGroups.add(proj); }
+  renderSessions();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const now = () => Date.now() / 1000;
+
+function relTime(ts) {
+  const d = now() - ts;
+  if (d < 60) return `${Math.round(d)}s`;
+  if (d < 3600) return `${Math.round(d/60)}m`;
+  return `${(d/3600).toFixed(1)}h`;
+}
+
+function fmtTokens(n) {
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function fmtUsd(n) {
+  if (n === 0) return '$0';
+  if (n < 0.001) return `$${(n*1000).toFixed(3)}m`;
+  return `$${n.toFixed(4)}`;
+}
+
+function badgeClass(type) {
+  return 'badge badge-' + (type || 'main');
+}
+
+function getActiveWindow() {
+  return parseInt(document.getElementById('windowFilter')?.value || '1800');
+}
+
+function getProjectFilter() {
+  return document.getElementById('projectFilter')?.value || '';
+}
+
+function getActiveSessions() {
+  const cutoff = now() - getActiveWindow();
+  const proj = getProjectFilter();
+  return Object.entries(sidecar)
+    .filter(([, s]) => (s.turns || []).length > 0)      // ghost filter: must have real turns
+    .filter(([, s]) => s.last_seen > cutoff)
+    .filter(([, s]) => !proj || s.project === proj)
+    .sort((a, b) => b[1].last_seen - a[1].last_seen);
+}
+
+function updateProjectFilter() {
+  const sel = document.getElementById('projectFilter');
+  const current = sel.value;
+  const projects = [...new Set(Object.values(sidecar).map(s => s.project).filter(Boolean))].sort();
+  sel.innerHTML = '<option value="">Tous les projets</option>' +
+    projects.map(p => {
+      const label = p.replace(/^(Documents-active-projects-|active-projects-|-home-pc-active-projects-)/, '');
+      return `<option value="${p}"${p===current?' selected':''}>${label}</option>`;
+    }).join('');
+}
+
+function renderAll() {
+  renderSessions();
+  updateSessionSelect();
+  renderChart();
+  renderRace();
+  renderCosts();
+}
+
+// ── Section 1: Active Sessions ────────────────────────────────────────────────
+function renderSessionCard(sid, s, isDismissed) {
+  const turns = s.turns || [];
+  const sortedTurns = [...turns].sort((a, b) => a.n - b.n);
+  const totalRead = turns.reduce((a, t) => a + (t.cache_read || 0), 0);
+  const totalCreation = turns.reduce((a, t) => a + (t.cache_creation || 0), 0);
+  const totalSavings = turns.reduce((a, t) => a + (t.cache_savings_usd || 0), 0);
+  const lastTurn = sortedTurns[sortedTurns.length - 1] || {};
+  const maxTurnN = sortedTurns.length > 0 ? sortedTurns[sortedTurns.length - 1].n : 0;
+  const recentTurns = sortedTurns.slice(-6);
+  const sessionTaskCounts = taskCounts[sid] || {};
+  const totalSubagents = Object.values(sessionTaskCounts).reduce((a, c) => a + (c.count || 0), 0);
+  function turnBar(t, isCurrent, sid) {
+    const tot = (t.input||0) + (t.cache_read||0) + (t.cache_creation||0);
+    const pR = tot ? (t.cache_read||0)/tot*100 : 0;
+    const p5 = tot ? (t.cache_5m||0)/tot*100 : 0;
+    const p1 = tot ? ((t.cache_1h||0)-(t.cache_5m||0))/tot*100 : 0;
+    const pI = tot ? (t.input||0)/tot*100 : 0;
+    const cls = isCurrent ? 'cache-bar cache-bar-current' : 'cache-bar';
+    const idx = recentTurns.indexOf(t);
+    const op  = isCurrent ? '' : ` style="opacity:${0.35 + 0.65*(idx/(recentTurns.length-1||1))}"`;
+    const turnInfo = (taskCounts[sid] || {})[String(t.n)];
+    const nTasks = turnInfo ? turnInfo.count : 0;
+    const agents = turnInfo ? (turnInfo.agents || []) : [];
+    const agentDescs = agents.map(a => a.desc || a.type || '?').join(', ');
+    const ttData = JSON.stringify({
+      n: t.n, input: t.input||0, read: t.cache_read||0,
+      w5: t.cache_5m||0, w1h: (t.cache_1h||0)-(t.cache_5m||0),
+      out: t.output||0, savings: t.cache_savings_usd||0,
+      agents: agents
+    }).replace(/"/g, '&quot;');
+    const time = t.ts ? new Date(t.ts*1000).toLocaleTimeString('fr-CA',{hour:'2-digit',minute:'2-digit'}) : '';
+    const taskBadge = nTasks ? `<span class="turn-tasks" title="${nTasks} agent(s): ${agentDescs}">&#x2B21;${nTasks}</span>` : `<span class="turn-tasks"></span>`;
+    const rowCls = nTasks ? 'turn-row has-agents' : 'turn-row';
+    const bar = `<div class="${cls}"${op} data-tt="${ttData}" onmouseenter="showTT(event,this)" onmouseleave="hideTT()"><div class="cache-bar-read" style="width:${pR}%"></div><div class="cache-bar-5m" style="width:${p5}%"></div><div class="cache-bar-1h" style="width:${p1}%"></div><div class="cache-bar-input" style="width:${pI}%"></div></div>`;
+    return `<div class="${rowCls}"><span class="turn-time">${time}</span>${bar}${taskBadge}</div>`;
+  }
+  const isSelected = sid === selectedSession;
+  const fork = s.parent_session ? `<div style="font-size:11px;color:var(--fork);margin-top:4px">↩ ${s.parent_session.substring(0,8)}…</div>` : '';
+  const reuse = lastTurn.fork_cache_reuse != null
+    ? `<div style="font-size:11px;color:var(--subagent);margin-top:2px">⚡ Reuse cache fork: ${(lastTurn.fork_cache_reuse*100).toFixed(1)}%</div>`
+    : '';
+
+  return `<div class="session-card${isSelected?' selected':''}${isDismissed?' dismissed':''}" onclick="selectSession('${sid}')">
+    <div class="card-top">
+      <span class="session-id">${sid.substring(0,8)}…</span>
+      <span class="${badgeClass(s.type)}">${s.type}</span>
+      <button class="btn-dismiss" title="${isDismissed?'Restaurer':'Archiver'}" onclick="dismiss('${sid}', event)">
+        ${isDismissed ? '↩' : '×'}
+      </button>
+    </div>
+    ${groupByProject ? '' : `<div class="card-project">${s.project || '—'}</div>`}
+    ${fork}${reuse}
+    <div class="card-stats">
+      <div class="stat"><span class="stat-label">Turns</span><span class="stat-value">${maxTurnN}</span></div>
+      ${totalSubagents ? `<div class="stat"><span class="stat-label">Subagents</span><span class="stat-value" style="color:var(--subagent)">&#x2B21;${totalSubagents}</span></div>` : ''}
+      <div class="stat"><span class="stat-label">Cache Read</span><span class="stat-value">${fmtTokens(totalRead)}</span></div>
+      <div class="stat"><span class="stat-label">Cache Write</span><span class="stat-value">${fmtTokens(totalCreation)}</span></div>
+      <div class="stat"><span class="stat-label">Économies</span><span class="stat-value green">${fmtUsd(totalSavings)}</span></div>
+      <div class="stat"><span class="stat-label">Vu il y a</span><span class="stat-value">${relTime(s.last_seen)}</span></div>
+    </div>
+    <div class="card-bottom">
+      <div class="turn-history">
+        ${recentTurns.map((t, i) => turnBar(t, i === recentTurns.length - 1, sid)).join('')}
+      </div>
+      <div class="bar-labels">
+        <span class="bar-label"><span class="bar-dot" style="background:var(--green)"></span>Read ×0.1</span>
+        <span class="bar-label"><span class="bar-dot" style="background:var(--fork)"></span>Write 5m</span>
+        <span class="bar-label"><span class="bar-dot" style="background:var(--main)"></span>Write 1h</span>
+        <span class="bar-label"><span class="bar-dot" style="background:var(--red)"></span>Input ×1</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderSessions() {
+  const active = getActiveSessions();
+  const dismissed = getDismissed();
+  const visible = showDismissed ? active : active.filter(([sid]) => !dismissed.has(sid));
+  const nDismissed = active.filter(([sid]) => dismissed.has(sid)).length;
+
+  document.getElementById('s1count').textContent = visible.length;
+  const dc = document.getElementById('dismissedCount');
+  dc.textContent = nDismissed > 0 ? `${nDismissed} archivée${nDismissed>1?'s':''}` : '';
+
+  const grid = document.getElementById('sessionGrid');
+
+  if (visible.length === 0) {
+    grid.innerHTML = '<div class="no-sessions">Aucune session active dans la dernière heure.</div>';
+    return;
+  }
+
+  if (!groupByProject) {
+    // Flat grid
+    grid.className = 'sessions-grid';
+    grid.innerHTML = visible.map(([sid, s]) => renderSessionCard(sid, s, dismissed.has(sid))).join('');
+    return;
+  }
+
+  // Grouped by project
+  grid.className = '';  // remove grid CSS, groups manage their own layout
+  const groups = {};
+  for (const [sid, s] of visible) {
+    const proj = s.project || '?';
+    if (!groups[proj]) groups[proj] = [];
+    groups[proj].push([sid, s]);
+  }
+
+  // Sort groups by most recent last_seen
+  const sortedGroups = Object.entries(groups).sort((a, b) =>
+    Math.max(...b[1].map(([, s]) => s.last_seen || 0)) - Math.max(...a[1].map(([, s]) => s.last_seen || 0))
+  );
+
+  grid.innerHTML = sortedGroups.map(([proj, sessions]) => {
+    const isCollapsed = collapsedGroups.has(proj);
+    const totalSavings = sessions.flatMap(([, s]) => s.turns || []).reduce((a, t) => a + (t.cache_savings_usd||0), 0);
+    const totalTurns = sessions.reduce((a, [, s]) => {
+      const t = s.turns || [];
+      return a + (t.length > 0 ? Math.max(...t.map(x => x.n)) : 0);
+    }, 0);
+    const mostRecent = Math.max(...sessions.map(([, s]) => s.last_seen || 0));
+    const types = [...new Set(sessions.map(([, s]) => s.type))];
+    const safeProj = proj.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+    const cardsHTML = sessions.map(([sid, s]) => renderSessionCard(sid, s, dismissed.has(sid))).join('');
+
+    return `<div class="project-group">
+      <div class="project-group-header" onclick="toggleGroup('${safeProj}')">
+        <span class="project-group-name">${proj}</span>
+        <div class="project-group-meta">
+          <span class="project-group-badge">${sessions.length} session${sessions.length>1?'s':''}</span>
+          <span class="project-group-badge">${totalTurns} turns</span>
+          ${types.map(t => `<span class="${badgeClass(t)}" style="font-size:10px;padding:1px 6px">${t}</span>`).join('')}
+          <span class="project-group-savings">${fmtUsd(totalSavings)}</span>
+          <span class="project-group-age">${relTime(mostRecent)}</span>
+        </div>
+        <span class="project-group-arrow">${isCollapsed ? '▶' : '▼'}</span>
+      </div>
+      ${isCollapsed ? '' : `<div class="project-group-content">${cardsHTML}</div>`}
+    </div>`;
+  }).join('');
+}
+
+// ── Section 2: Token Chart ────────────────────────────────────────────────────
+function updateSessionSelect() {
+  const select = document.getElementById('sessionSelect');
+  const dismissed = getDismissed();
+  const active = getActiveSessions().filter(([sid]) => !dismissed.has(sid));
+
+  // Update options, preserve selection
+  const current = select.value;
+  select.innerHTML = '<option value="">— Sélectionner —</option>' +
+    active.map(([sid, s]) => {
+      const label = `${s.project || '?'} — ${sid.substring(0,8)} (${s.type})`;
+      return `<option value="${sid}"${sid===current?' selected':''}>${label}</option>`;
+    }).join('');
+
+  // Auto-select if only one or if previous selection gone
+  if (!current && active.length > 0) {
+    select.value = active[0][0];
+    selectedSession = active[0][0];
+  } else if (!sidecar[current]) {
+    select.value = '';
+    selectedSession = null;
+  }
+}
+
+function selectSession(sid) {
+  selectedSession = sid;
+  document.getElementById('sessionSelect').value = sid;
+  renderChart();
+  renderSessions(); // re-render to update selected state
+}
+
+function renderChart() {
+  const sid = document.getElementById('sessionSelect').value;
+  selectedSession = sid;
+
+  const s = sid ? sidecar[sid] : null;
+  const turns = s ? (s.turns || []) : [];
+  const meta = document.getElementById('s2meta');
+
+  if (!s || turns.length === 0) {
+    meta.textContent = '';
+    if (tokenChart) { tokenChart.data.labels = []; tokenChart.data.datasets.forEach(d => d.data = []); tokenChart.update(); }
+    return;
+  }
+
+  const sorted = [...turns].sort((a, b) => a.n - b.n);
+  const labels = sorted.map(t => `T${t.n}`);
+  const totalSavings = turns.reduce((a, t) => a + (t.cache_savings_usd||0), 0);
+  meta.textContent = `${turns.length} turns — économies totales: ${fmtUsd(totalSavings)}`;
+
+  const datasets = [
+    {
+      label: 'Cache Read',
+      data: sorted.map(t => t.cache_read || 0),
+      backgroundColor: 'rgba(34,197,94,0.6)',
+      borderColor: 'rgba(34,197,94,0.9)',
+      fill: true, tension: 0.3,
+    },
+    {
+      label: 'Cache 1h Write',
+      data: sorted.map(t => Math.max(0, (t.cache_1h||0) - (t.cache_5m||0))),
+      backgroundColor: 'rgba(59,130,246,0.5)',
+      borderColor: 'rgba(59,130,246,0.8)',
+      fill: true, tension: 0.3,
+    },
+    {
+      label: 'Cache 5m Write',
+      data: sorted.map(t => t.cache_5m || 0),
+      backgroundColor: 'rgba(245,158,11,0.5)',
+      borderColor: 'rgba(245,158,11,0.8)',
+      fill: true, tension: 0.3,
+    },
+    {
+      label: 'Input (nouveau)',
+      data: sorted.map(t => t.input || 0),
+      backgroundColor: 'rgba(100,116,139,0.4)',
+      borderColor: 'rgba(100,116,139,0.7)',
+      fill: true, tension: 0.3,
+    },
+  ];
+
+  const ctx = document.getElementById('tokenChart').getContext('2d');
+  if (tokenChart) {
+    tokenChart.data.labels = labels;
+    tokenChart.data.datasets = datasets;
+    tokenChart.update();
+  } else {
+    tokenChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#94a3b8', font: { size: 11 } } },
+          tooltip: {
+            backgroundColor: '#1a1d27',
+            borderColor: '#2a2d3e',
+            borderWidth: 1,
+            titleColor: '#e2e8f0',
+            bodyColor: '#94a3b8',
+            callbacks: {
+              label: ctx => `${ctx.dataset.label}: ${fmtTokens(ctx.raw)}`,
+            }
+          },
+        },
+        scales: {
+          x: { stacked: true, ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#2a2d3e' } },
+          y: { stacked: true, ticks: { color: '#64748b', font: { size: 11 }, callback: v => fmtTokens(v) }, grid: { color: '#2a2d3e' } },
+        },
+      },
+    });
+  }
+}
+
+document.getElementById('sessionSelect').addEventListener('change', renderChart);
+
+// ── Section 3: Race Detector ──────────────────────────────────────────────────
+function renderRace() {
+  const active = getActiveSessions();
+  const container = document.getElementById('raceSection');
+
+  if (active.length < 2) {
+    document.getElementById('s3count').textContent = '0';
+    container.innerHTML = '<div class="empty-state">Moins de 2 sessions actives — pas de course détectée.</div>';
+    return;
+  }
+
+  // Find groups of concurrent sessions (last_seen within TEAM_WINDOW)
+  const groups = [];
+  const visited = new Set();
+
+  for (let i = 0; i < active.length; i++) {
+    const [sid_i, s_i] = active[i];
+    if (visited.has(sid_i)) continue;
+    const group = [[sid_i, s_i]];
+    visited.add(sid_i);
+
+    for (let j = i + 1; j < active.length; j++) {
+      const [sid_j, s_j] = active[j];
+      if (visited.has(sid_j)) continue;
+      if (Math.abs(s_i.last_seen - s_j.last_seen) < TEAM_WINDOW) {
+        group.push([sid_j, s_j]);
+        visited.add(sid_j);
+      }
+    }
+
+    if (group.length > 1) groups.push(group);
+  }
+
+  document.getElementById('s3count').textContent = groups.length;
+
+  if (groups.length === 0) {
+    container.innerHTML = '<div class="empty-state">Aucun groupe de sessions concurrent (fenêtre 5min).</div>';
+    return;
+  }
+
+  const maxTurns = Math.max(...active.map(([, s]) => (s.turns||[]).length), 1);
+
+  container.innerHTML = groups.map((group, gi) => {
+    const rows = group.map(([sid, s]) => {
+      const turns = (s.turns||[]).length;
+      const pct = Math.round(turns / maxTurns * 100);
+      const typeColor = { main: 'var(--main)', subagent: 'var(--subagent)', fork: 'var(--fork)', team_agent: 'var(--team)' }[s.type] || 'var(--muted)';
+      const totalSavings = (s.turns||[]).reduce((a, t) => a + (t.cache_savings_usd||0), 0);
+      return `<div class="race-row">
+        <span class="race-label">${sid.substring(0,8)}…</span>
+        <div class="race-bar-outer">
+          <div class="race-bar-inner" style="width:${pct}%;background:${typeColor};color:#fff">
+            ${turns > 0 ? turns + ' turns' : ''}
+          </div>
+        </div>
+        <span class="race-meta">${fmtUsd(totalSavings)}</span>
+      </div>`;
+    }).join('');
+
+    return `<div class="race-group">
+      <div class="race-title">Groupe ${gi+1} — ${group.length} sessions</div>
+      ${rows}
+    </div>`;
+  }).join('');
+}
+
+// ── Section 4: Cost Trends ────────────────────────────────────────────────────
+function renderCosts() {
+  const active = getActiveSessions();
+  const grid = document.getElementById('costGrid');
+
+  if (active.length === 0) {
+    grid.innerHTML = '<div class="empty-state">Aucune session active.</div>';
+    return;
+  }
+
+  // Sort by total savings desc
+  const withCosts = active.map(([sid, s]) => {
+    const turns = s.turns || [];
+    const savings = turns.reduce((a, t) => a + (t.cache_savings_usd||0), 0);
+    const surcharge = turns.reduce((a, t) => a + (t.cache_surcharge_usd||0), 0);
+    const net = savings - surcharge;
+    return { sid, s, savings, surcharge, net };
+  }).sort((a, b) => b.savings - a.savings);
+
+  const maxSavings = Math.max(...withCosts.map(x => x.savings), 0.001);
+
+  grid.innerHTML = withCosts.map(({ sid, s, savings, surcharge, net }) => {
+    const pct = Math.round(savings / maxSavings * 100);
+    const netColor = net >= 0 ? 'var(--green)' : 'var(--red)';
+    return `<div class="cost-card">
+      <div class="cost-card-title" title="${sid}">${s.project || '?'} (${sid.substring(0,8)})</div>
+      <div class="cost-row">
+        <span class="cost-label">Économies read</span>
+        <span class="cost-value green">${fmtUsd(savings)}</span>
+      </div>
+      <div class="cost-row">
+        <span class="cost-label">Surcharge write</span>
+        <span class="cost-value amber">${fmtUsd(surcharge)}</span>
+      </div>
+      <div class="cost-row cost-net">
+        <span class="cost-label">Net</span>
+        <span class="cost-value" style="color:${netColor}">${fmtUsd(net)}</span>
+      </div>
+      <div class="cost-bar-wrap">
+        <div class="cost-bar-outer">
+          <div class="cost-bar-inner" style="width:${pct}%"></div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Main Refresh Loop ─────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch('/api/sidecar', { cache: 'no-store' }),
+      fetch('/api/task-counts', { cache: 'no-store' }),
+    ]);
+    if (!r1.ok) throw new Error(`HTTP ${r1.status}`);
+    sidecar = await r1.json();
+    taskCounts = r2.ok ? await r2.json() : {};
+
+    dot.className = 'status-dot live';
+    lastUpdated.textContent = `Mis à jour: ${new Date().toLocaleTimeString()}`;
+
+    updateProjectFilter();
+    renderSessions();
+    updateSessionSelect();
+    renderChart();
+    renderRace();
+    renderCosts();
+  } catch (e) {
+    dot.className = 'status-dot';
+    lastUpdated.textContent = `Erreur: ${e.message}`;
+  }
+}
+
+// Initial load + polling
+refresh();
+setInterval(refresh, POLL_INTERVAL);
+
+// ── Turn tooltip ──────────────────────────────────────────────────────────────
+function fmtT(n) {
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+function showTT(e, el) {
+  const d = JSON.parse(el.dataset.tt.replace(/&quot;/g, '"'));
+  const tt = document.getElementById('turn-tooltip');
+  const agents = d.agents || [];
+  const agentRows = agents.length > 0
+    ? `<div style="margin-top:4px;border-top:1px solid var(--border);padding-top:4px">
+        <div class="tt-row"><span class="tt-label" style="color:var(--subagent)">&#x2B21; Subagents</span><span class="tt-val" style="color:var(--subagent)">${agents.length}</span></div>
+        ${agents.map(a => `<div style="font-size:10px;color:var(--subagent);padding-left:8px;margin-top:2px">${a.type ? '<b>'+a.type+'</b> ' : ''}${a.desc || ''}</div>`).join('')}
+      </div>`
+    : '';
+  tt.innerHTML = `
+    <div class="tt-title">Cycle #${d.n}</div>
+    <div class="tt-row"><span class="tt-label" style="color:var(--green)">Read ×0.1</span><span class="tt-val">${fmtT(d.read)}</span></div>
+    <div class="tt-row"><span class="tt-label" style="color:var(--fork)">Write 5m</span><span class="tt-val">${fmtT(d.w5)}</span></div>
+    <div class="tt-row"><span class="tt-label" style="color:var(--main)">Write 1h</span><span class="tt-val">${fmtT(d.w1h)}</span></div>
+    <div class="tt-row"><span class="tt-label" style="color:var(--red)">Input ×1</span><span class="tt-val">${fmtT(d.input)}</span></div>
+    <div class="tt-row"><span class="tt-label">Output</span><span class="tt-val">${fmtT(d.out)}</span></div>
+    <div class="tt-row" style="margin-top:4px;border-top:1px solid var(--border);padding-top:4px"><span class="tt-label">Économies</span><span class="tt-val" style="color:var(--green)">$${d.savings.toFixed(4)}</span></div>
+    ${agentRows}`;
+  tt.style.display = 'block';
+  moveTT(e);
+}
+function moveTT(e) {
+  const tt = document.getElementById('turn-tooltip');
+  if (tt.style.display === 'none') return;
+  const x = e.clientX + 14, y = e.clientY - 10;
+  const w = tt.offsetWidth, h = tt.offsetHeight;
+  tt.style.left = (x + w > window.innerWidth ? x - w - 20 : x) + 'px';
+  tt.style.top  = (y + h > window.innerHeight ? y - h : y) + 'px';
+}
+function hideTT() { document.getElementById('turn-tooltip').style.display = 'none'; }
+document.addEventListener('mousemove', moveTT);
+</script>
+<div id="turn-tooltip"></div>
+</body>
+</html>
