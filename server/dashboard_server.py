@@ -42,8 +42,11 @@ def scan_task_counts() -> dict:
                 continue
             for tf in itertools.chain(project_dir.glob("*.jsonl"), project_dir.glob("*/subagents/agent-*.jsonl")):
                 try:
-                    first = json.loads(tf.read_text().split("\n")[0])
-                    sid = first.get("sessionId", tf.stem)
+                    with open(tf) as f:
+                        first = json.loads(f.readline())
+                    raw_sid = first.get("sessionId", tf.stem)
+                    is_sub = "/subagents/" in str(tf)
+                    sid = f"{raw_sid}::{tf.stem}" if is_sub else raw_sid
                     if sid in sidecar:
                         if sid not in sid_to_file or tf.stat().st_mtime > sid_to_file[sid].stat().st_mtime:
                             sid_to_file[sid] = tf

@@ -9,6 +9,7 @@ Resilience: If Langfuse is unavailable, traces are queued locally and
 automatically drained on the next successful connection.
 """
 
+import fcntl
 import itertools
 import json
 import os
@@ -338,11 +339,16 @@ def detect_session_type(transcript_file: Path, session_id: str, file_mtime: floa
 
 
 def load_sidecar() -> dict:
-    """Load the sidecar JSON file (token metrics per session)."""
+    """Load the sidecar JSON file (token metrics per session) with shared lock."""
     if not SIDECAR_FILE.exists():
         return {}
     try:
-        return json.loads(SIDECAR_FILE.read_text())
+        with open(SIDECAR_LOCK, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_SH)
+            try:
+                return json.loads(SIDECAR_FILE.read_text())
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
     except (json.JSONDecodeError, IOError):
         return {}
 
@@ -363,11 +369,14 @@ def reconcile_sidecar(sidecar: dict) -> int:
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
                 continue
-            for transcript_file in project_dir.glob("*.jsonl"):
+            for transcript_file in itertools.chain(project_dir.glob("*.jsonl"), project_dir.glob("*/subagents/agent-*.jsonl")):
                 try:
-                    first_line = transcript_file.read_text().split("\n")[0]
+                    with open(transcript_file) as f:
+                        first_line = f.readline()
                     first_msg = json.loads(first_line)
-                    sid = first_msg.get("sessionId", transcript_file.stem)
+                    raw_sid = first_msg.get("sessionId", transcript_file.stem)
+                    is_sub = "/subagents/" in str(transcript_file)
+                    sid = f"{raw_sid}::{transcript_file.stem}" if is_sub else raw_sid
                     if sid in sidecar:
                         # Keep the LARGEST mtime in case of resumed sessions
                         # (multiple .jsonl files sharing the same sessionId)
@@ -395,11 +404,19 @@ def reconcile_sidecar(sidecar: dict) -> int:
     return corrected
 
 
+SIDECAR_LOCK = SIDECAR_FILE.with_suffix(".lock")
+
+
 def save_sidecar(data: dict) -> None:
-    """Write the sidecar JSON atomically."""
-    tmp = SIDECAR_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, separators=(",", ":")))
-    tmp.replace(SIDECAR_FILE)
+    """Write the sidecar JSON atomically with file lock."""
+    with open(SIDECAR_LOCK, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            tmp = SIDECAR_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, separators=(",", ":")))
+            tmp.replace(SIDECAR_FILE)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def update_sidecar(
@@ -574,9 +591,16 @@ def find_modified_transcripts(state: dict, max_sessions: int = 10) -> list[tuple
                 mtime = transcript_file.stat().st_mtime
 
                 # Extract session ID from the first line
-                first_line = transcript_file.read_text().split("\n")[0]
+                # Use readline() instead of read_text() to avoid loading multi-MB files
+                with open(transcript_file) as f:
+                    first_line = f.readline()
                 first_msg = json.loads(first_line)
-                session_id = first_msg.get("sessionId", transcript_file.stem)
+                raw_session_id = first_msg.get("sessionId", transcript_file.stem)
+
+                # Subagent files share the parent's sessionId — use a composite key
+                # to avoid state collision (last_line, turn_count) between files
+                is_subagent_file = "/subagents/" in str(transcript_file)
+                session_id = f"{raw_session_id}::{transcript_file.stem}" if is_subagent_file else raw_session_id
 
                 # Skip ghost sessions: already fully processed with 0 turns (no user messages)
                 # Only skip if the file hasn't been modified since — a "ghost" that has
