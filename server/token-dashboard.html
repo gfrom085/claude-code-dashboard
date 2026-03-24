@@ -119,6 +119,28 @@
   #turn-tooltip .tt-val { font-weight: 500; }
   .no-sessions { color: var(--muted); text-align: center; padding: 32px; }
 
+  /* Speedometer gauge */
+  .gauge-section {
+    display: flex; align-items: center; gap: 24px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 20px 24px;
+  }
+  .gauge-wrap { position: relative; width: 220px; height: 130px; flex-shrink: 0; }
+  .gauge-wrap canvas { width: 220px; height: 130px; }
+  .gauge-value {
+    position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: var(--text); text-align: center; line-height: 1;
+  }
+  .gauge-unit { font-size: 11px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
+  .gauge-stats { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
+  .gauge-stat-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .gauge-stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .gauge-stat-value { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .gauge-stat-value.hot { color: #f97316; }
+  .gauge-stat-value.warm { color: var(--fork); }
+  .gauge-stat-value.cool { color: var(--green); }
+
   /* Project groups */
   .project-group { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 10px; }
   .project-group:last-child { margin-bottom: 0; }
@@ -181,6 +203,32 @@
 </header>
 
 <main>
+
+  <!-- S0: Cache Throughput Gauge -->
+  <div class="gauge-section">
+    <div class="gauge-wrap">
+      <canvas id="gaugeCanvas" width="440" height="260"></canvas>
+      <div class="gauge-value" id="gaugeValue">0<span class="gauge-unit">M tok/min</span></div>
+    </div>
+    <div class="gauge-stats">
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Sessions actives</span>
+        <span class="gauge-stat-value" id="gaugeSessions">0</span>
+      </div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Cache read total</span>
+        <span class="gauge-stat-value" id="gaugeTotalRead">0</span>
+      </div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Pic session</span>
+        <span class="gauge-stat-value hot" id="gaugePeakSession">—</span>
+      </div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Coût cache/min</span>
+        <span class="gauge-stat-value warm" id="gaugeCostMin">$0</span>
+      </div>
+    </div>
+  </div>
 
   <!-- S1: Active Sessions -->
   <section>
@@ -265,6 +313,157 @@ let selectedSession = null;
 let showDismissed = false;
 let groupByProject = true;  // default: grouped
 const collapsedGroups = new Set();
+
+// ── Gauge state ──────────────────────────────────────────────────────────────
+let prevCacheTotal = null;
+let prevCacheTs = null;
+let currentRate = 0;       // tokens/min smoothed
+let peakRate = 0;
+const GAUGE_MAX = 100;     // M tok/min — scale max
+const rateHistory = [];    // last N rates for smoothing
+
+function drawGauge(rate) {
+  const canvas = document.getElementById('gaugeCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const cx = W / 2, cy = H - 20;
+  const R = Math.min(cx - 20, cy - 10);
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Arc background
+  const startAngle = Math.PI;
+  const endAngle = 2 * Math.PI;
+
+  // Gradient segments: green → yellow → orange → red
+  const segments = [
+    { from: 0,    to: 0.25, color: '#22c55e' },
+    { from: 0.25, to: 0.50, color: '#84cc16' },
+    { from: 0.50, to: 0.70, color: '#eab308' },
+    { from: 0.70, to: 0.85, color: '#f97316' },
+    { from: 0.85, to: 1.00, color: '#ef4444' },
+  ];
+
+  // Draw arc segments
+  ctx.lineWidth = 18;
+  ctx.lineCap = 'butt';
+  for (const seg of segments) {
+    const a1 = startAngle + seg.from * Math.PI;
+    const a2 = startAngle + seg.to * Math.PI;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a1, a2);
+    ctx.strokeStyle = seg.color + '40';  // dim
+    ctx.stroke();
+  }
+
+  // Draw filled arc up to current rate
+  const pct = Math.min(rate / GAUGE_MAX, 1);
+  const filledEnd = startAngle + pct * Math.PI;
+  ctx.lineWidth = 18;
+  ctx.lineCap = 'round';
+  for (const seg of segments) {
+    const a1 = startAngle + seg.from * Math.PI;
+    const a2 = startAngle + seg.to * Math.PI;
+    if (a1 >= filledEnd) break;
+    const clampEnd = Math.min(a2, filledEnd);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a1, clampEnd);
+    ctx.strokeStyle = seg.color;
+    ctx.shadowColor = seg.color;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  // Needle
+  const needleAngle = startAngle + pct * Math.PI;
+  const needleLen = R - 25;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(
+    cx + Math.cos(needleAngle) * needleLen,
+    cy + Math.sin(needleAngle) * needleLen
+  );
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.shadowColor = '#e2e8f0';
+  ctx.shadowBlur = 6;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Center dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fill();
+
+  // Scale labels
+  ctx.font = '11px Inter, system-ui, sans-serif';
+  ctx.fillStyle = '#64748b';
+  ctx.textAlign = 'center';
+  const ticks = [0, 10, 25, 50, 75, 100];
+  for (const v of ticks) {
+    const a = startAngle + (v / GAUGE_MAX) * Math.PI;
+    const tx = cx + Math.cos(a) * (R + 16);
+    const ty = cy + Math.sin(a) * (R + 16);
+    ctx.fillText(v + '', tx, ty + 4);
+  }
+}
+
+function updateGauge() {
+  const active = getActiveSessions();
+  const totalCacheRead = active.reduce((sum, [, s]) =>
+    sum + (s.turns || []).reduce((a, t) => a + (t.cache_read || 0), 0), 0);
+  const tsNow = Date.now();
+
+  let rate = 0;
+  if (prevCacheTotal !== null && prevCacheTs !== null) {
+    const dtMin = (tsNow - prevCacheTs) / 60000;
+    if (dtMin > 0.01) {
+      const delta = totalCacheRead - prevCacheTotal;
+      rate = Math.max(0, delta / dtMin / 1e6);  // M tok/min
+    }
+  }
+  prevCacheTotal = totalCacheRead;
+  prevCacheTs = tsNow;
+
+  // Smooth with EMA
+  rateHistory.push(rate);
+  if (rateHistory.length > 6) rateHistory.shift();
+  currentRate = rateHistory.reduce((a, b) => a + b, 0) / rateHistory.length;
+  if (currentRate > peakRate) peakRate = currentRate;
+
+  drawGauge(currentRate);
+
+  // Update text
+  document.getElementById('gaugeValue').innerHTML =
+    `${currentRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
+  document.getElementById('gaugeSessions').textContent = active.length;
+  document.getElementById('gaugeTotalRead').textContent = fmtTokens(totalCacheRead);
+
+  // Peak per-session rate
+  let peakSid = '—', peakSessionRate = 0;
+  for (const [sid, s] of active) {
+    const turns = (s.turns || []).sort((a, b) => (a.ts||0) - (b.ts||0));
+    if (turns.length < 2) continue;
+    const last = turns[turns.length - 1];
+    const prev = turns[turns.length - 2];
+    if (last.ts && prev.ts && last.ts > prev.ts) {
+      const dt = (last.ts - prev.ts) / 60;
+      const r = (last.cache_read || 0) / dt / 1e6;
+      if (r > peakSessionRate) { peakSessionRate = r; peakSid = sid.substring(0, 8); }
+    }
+  }
+  document.getElementById('gaugePeakSession').textContent =
+    peakSessionRate > 0 ? `${peakSessionRate.toFixed(1)}M/min (${peakSid})` : '—';
+
+  // Cost per min (cache read @ $0.30/MTok)
+  const costMin = currentRate * 0.30;
+  document.getElementById('gaugeCostMin').textContent =
+    costMin > 0 ? `$${costMin.toFixed(2)}/min` : '$0';
+}
 const dot = document.getElementById('dot');
 const lastUpdated = document.getElementById('lastUpdated');
 
@@ -769,6 +968,7 @@ async function refresh() {
     renderChart();
     renderRace();
     renderCosts();
+    updateGauge();
   } catch (e) {
     dot.className = 'status-dot';
     lastUpdated.textContent = `Erreur: ${e.message}`;
