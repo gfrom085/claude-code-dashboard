@@ -339,18 +339,40 @@ def detect_session_type(transcript_file: Path, session_id: str, file_mtime: floa
 
 
 def load_sidecar() -> dict:
-    """Load the sidecar JSON file (token metrics per session) with shared lock."""
+    """Load the sidecar JSON file (token metrics per session).
+
+    NOTE: Caller must hold SIDECAR_LOCK exclusively for the full
+    read-modify-write cycle. See acquire_sidecar_lock().
+    """
     if not SIDECAR_FILE.exists():
         return {}
     try:
-        with open(SIDECAR_LOCK, "w") as lf:
-            fcntl.flock(lf, fcntl.LOCK_SH)
-            try:
-                return json.loads(SIDECAR_FILE.read_text())
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+        return json.loads(SIDECAR_FILE.read_text())
     except (json.JSONDecodeError, IOError):
         return {}
+
+
+def acquire_sidecar_lock():
+    """Acquire exclusive lock for the full sidecar read-modify-write cycle.
+
+    Usage:
+        lock_fd = acquire_sidecar_lock()
+        try:
+            sidecar = load_sidecar()
+            # ... modify sidecar ...
+            save_sidecar(sidecar)
+        finally:
+            release_sidecar_lock(lock_fd)
+    """
+    lf = open(SIDECAR_LOCK, "w")
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    return lf
+
+
+def release_sidecar_lock(lf):
+    """Release the sidecar lock."""
+    fcntl.flock(lf, fcntl.LOCK_UN)
+    lf.close()
 
 
 def reconcile_sidecar(sidecar: dict) -> int:
@@ -408,15 +430,13 @@ SIDECAR_LOCK = SIDECAR_FILE.with_suffix(".lock")
 
 
 def save_sidecar(data: dict) -> None:
-    """Write the sidecar JSON atomically with file lock."""
-    with open(SIDECAR_LOCK, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            tmp = SIDECAR_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, separators=(",", ":")))
-            tmp.replace(SIDECAR_FILE)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    """Write the sidecar JSON atomically.
+
+    NOTE: Caller must hold SIDECAR_LOCK exclusively. See acquire_sidecar_lock().
+    """
+    tmp = SIDECAR_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":")))
+    tmp.replace(SIDECAR_FILE)
 
 
 def update_sidecar(
@@ -893,29 +913,31 @@ def process_transcript(
     last_line = session_state.get("last_line", 0)
     turn_count = session_state.get("turn_count", 0)
 
-    # Read transcript
-    lines = transcript_file.read_text().strip().split("\n")
-    total_lines = len(lines)
+    # Read only new lines from transcript (skip already-processed lines)
+    # Avoids loading multi-MB files into memory on every hook invocation
+    file_mtime = transcript_file.stat().st_mtime
+    new_messages = []
+    total_lines = 0
+    with open(transcript_file) as f:
+        for i, line in enumerate(f):
+            total_lines = i + 1
+            if i < last_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                new_messages.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
-    if last_line >= total_lines:
+    if not new_messages:
         debug(f"No new lines to process (last: {last_line}, total: {total_lines})")
         return 0
-
-    # File mtime — used as last_seen timestamp (accurate for both current and historical sessions)
-    file_mtime = transcript_file.stat().st_mtime
 
     # Detect session type (once per transcript)
     session_type, parent_session = detect_session_type(transcript_file, session_id, file_mtime)
     debug(f"Session type: {session_type}, parent: {parent_session}")
-
-    # Parse new messages
-    new_messages = []
-    for i in range(last_line, total_lines):
-        try:
-            msg = json.loads(lines[i])
-            new_messages.append(msg)
-        except json.JSONDecodeError:
-            continue
 
     if not new_messages:
         return 0
@@ -1135,10 +1157,12 @@ def main():
         log("ERROR", f"Failed to initialize Langfuse client: {e}")
         sys.exit(0)
 
-    # Load sidecar once; write at end
-    sidecar = load_sidecar()
-
+    # Exclusive lock for the full sidecar read-modify-write cycle.
+    # Prevents TOCTOU races when multiple hooks fire concurrently (SubagentStop).
+    sidecar_lock = acquire_sidecar_lock()
     try:
+        sidecar = load_sidecar()
+
         # First, drain any queued traces
         drained = drain_queue(langfuse)
         if drained > 0:
@@ -1190,6 +1214,7 @@ def main():
         import traceback
         debug(traceback.format_exc())
     finally:
+        release_sidecar_lock(sidecar_lock)
         langfuse.shutdown()
 
     sys.exit(0)

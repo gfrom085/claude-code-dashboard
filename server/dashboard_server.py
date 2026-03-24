@@ -129,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No CORS header — dashboard is served from same origin (localhost:PORT)
         self.end_headers()
         self.wfile.write(body)
 
@@ -181,11 +181,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "cache_audit.py not found"}, 404)
             return
 
+        import re
+        SAFE_PARAM = re.compile(r"^[a-zA-Z0-9._\-]{1,128}$")
+
         cmd = [sys.executable, str(script), "--no-write"]
         if "session" in params:
-            cmd.extend(["--session", params["session"][0]])
+            val = params["session"][0]
+            if not SAFE_PARAM.match(val):
+                self.send_json({"error": "invalid session param"}, 400)
+                return
+            cmd.extend(["--session", val])
         if "project" in params:
-            cmd.extend(["--project", params["project"][0]])
+            val = params["project"][0]
+            if not SAFE_PARAM.match(val):
+                self.send_json({"error": "invalid project param"}, 400)
+                return
+            cmd.extend(["--project", val])
 
         try:
             result = subprocess.run(
