@@ -7,6 +7,7 @@ Usage: python3 ~/.claude/state/dashboard_server.py [port]
 Default port: 8765
 """
 
+import itertools
 import json
 import subprocess
 import sys
@@ -39,7 +40,7 @@ def scan_task_counts() -> dict:
         for project_dir in PROJECTS_DIR.iterdir():
             if not project_dir.is_dir():
                 continue
-            for tf in project_dir.glob("*.jsonl"):
+            for tf in itertools.chain(project_dir.glob("*.jsonl"), project_dir.glob("*/subagents/agent-*.jsonl")):
                 try:
                     first = json.loads(tf.read_text().split("\n")[0])
                     sid = first.get("sessionId", tf.stem)

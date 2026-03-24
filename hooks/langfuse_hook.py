@@ -9,6 +9,7 @@ Resilience: If Langfuse is unavailable, traces are queued locally and
 automatically drained on the next successful connection.
 """
 
+import itertools
 import json
 import os
 import sys
@@ -562,9 +563,12 @@ def find_modified_transcripts(state: dict, max_sessions: int = 10) -> list[tuple
 
         project_name = extract_project_name(project_dir)
 
-        # Look for all .jsonl files directly in the project directory
-        # Includes both UUID-named (main) and agent-*.jsonl (subagents)
-        for transcript_file in project_dir.glob("*.jsonl"):
+        # Look for all .jsonl files: project root + subagent subdirs
+        # Root: UUID-named (main sessions), agent-*.jsonl (legacy subagents)
+        # Subdirs: <session_id>/subagents/agent-*.jsonl (current subagent layout)
+        root_files = project_dir.glob("*.jsonl")
+        subagent_files = project_dir.glob("*/subagents/agent-*.jsonl")
+        for transcript_file in itertools.chain(root_files, subagent_files):
             try:
                 # Get file modification time
                 mtime = transcript_file.stat().st_mtime
