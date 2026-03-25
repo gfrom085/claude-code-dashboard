@@ -328,7 +328,8 @@ let displayRate = 0;       // M tok/min — what the needle shows (animated)
 let peakRate = 0;
 let lastGaugeTs = null;
 let gaugeIntervalId = null;
-const GAUGE_MAX = 1000;    // M tok/min — scale max
+let GAUGE_MAX = 100;       // M tok/min — dynamic scale, starts at 100
+let _gaugeScaleDownCount = 0;
 const DECAY_HALF_LIFE = 30000; // ms — needle halves every 30s (gentle fade)
 const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
 const ATTACK_TAU = 5000;       // ms — ramp-up reaches ~95% in 5s (matches poll interval)
@@ -427,7 +428,9 @@ function drawGauge(rate) {
   ctx.font = '11px Inter, system-ui, sans-serif';
   ctx.fillStyle = '#64748b';
   ctx.textAlign = 'center';
-  for (const v of [0, 100, 250, 500, 750, 1000]) {
+  // Dynamic labels based on current GAUGE_MAX
+  const steps = [0, 0.1, 0.25, 0.5, 0.75, 1].map(f => Math.round(f * GAUGE_MAX));
+  for (const v of steps) {
     const a = startAngle + (v / GAUGE_MAX) * Math.PI;
     ctx.fillText(v + '', cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16) + 4);
   }
@@ -492,6 +495,20 @@ function updateGauge() {
   // Set target — animation loop handles the rest
   targetRate = rawRate;
   if (rawRate > peakRate) peakRate = rawRate;
+
+  // Dynamic scale: grow if rate > 70% of max, shrink if < 20% for 6 polls (30s)
+  if (rawRate > GAUGE_MAX * 0.7) {
+    GAUGE_MAX = Math.ceil(rawRate / 100) * 100 * 2;  // round up to next 100, then 2x headroom
+    _gaugeScaleDownCount = 0;
+  } else if (rawRate < GAUGE_MAX * 0.2 && GAUGE_MAX > 100) {
+    _gaugeScaleDownCount = (_gaugeScaleDownCount || 0) + 1;
+    if (_gaugeScaleDownCount >= 6) {
+      GAUGE_MAX = Math.max(100, Math.ceil(rawRate / 50) * 50 * 2 || 100);
+      _gaugeScaleDownCount = 0;
+    }
+  } else {
+    _gaugeScaleDownCount = 0;
+  }
 
   // Update static stats (not animated)
   gaugeActiveSessions = active.length;
