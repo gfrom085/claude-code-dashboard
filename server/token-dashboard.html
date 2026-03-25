@@ -455,6 +455,17 @@ function gaugeAnimFrame(ts) {
 
   drawGauge(displayRate);
 
+  // Idle detection: stop animation after 2s of inactivity
+  if (displayRate < 0.01 && targetRate === 0) {
+    gaugeIdleFrames++;
+    if (gaugeIdleFrames > 120) {
+      gaugeAnimRunning = false;
+      return;
+    }
+  } else {
+    gaugeIdleFrames = 0;
+  }
+
   // Update text at ~10fps to avoid DOM thrash
   if (dt > 100 || !lastFrameTs) {
     document.getElementById('gaugeValue').innerHTML =
@@ -647,7 +658,7 @@ function renderSessionCard(sid, s, isDismissed) {
     const tot = (t.input||0) + (t.cache_read||0) + (t.cache_creation||0);
     const pR = tot ? (t.cache_read||0)/tot*100 : 0;
     const p5 = tot ? (t.cache_5m||0)/tot*100 : 0;
-    const p1 = tot ? ((t.cache_1h||0)-(t.cache_5m||0))/tot*100 : 0;
+    const p1 = tot ? (t.cache_1h||0)/tot*100 : 0;
     const pI = tot ? (t.input||0)/tot*100 : 0;
     const cls = isCurrent ? 'cache-bar cache-bar-current' : 'cache-bar';
     const idx = recentTurns.indexOf(t);
@@ -658,7 +669,7 @@ function renderSessionCard(sid, s, isDismissed) {
     const agentDescs = agents.map(a => a.desc || a.type || '?').join(', ');
     const ttData = JSON.stringify({
       n: t.n, input: t.input||0, read: t.cache_read||0,
-      w5: t.cache_5m||0, w1h: (t.cache_1h||0)-(t.cache_5m||0),
+      w5: t.cache_5m||0, w1h: t.cache_1h||0,
       out: t.output||0, savings: t.cache_savings_usd||0,
       agents: agents
     }).replace(/"/g, '&quot;');
@@ -1006,11 +1017,14 @@ function renderCosts() {
 
 // ── Main Refresh Loop ─────────────────────────────────────────────────────────
 async function refresh() {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
   try {
     const [r1, r2] = await Promise.all([
-      fetch('/api/sidecar', { cache: 'no-store' }),
-      fetch('/api/task-counts', { cache: 'no-store' }),
+      fetch('/api/sidecar', { cache: 'no-store', signal: controller.signal }),
+      fetch('/api/task-counts', { cache: 'no-store', signal: controller.signal }),
     ]);
+    clearTimeout(timeoutId);
     if (!r1.ok) throw new Error(`HTTP ${r1.status}`);
     sidecar = await r1.json();
     taskCounts = r2.ok ? await r2.json() : {};
@@ -1026,8 +1040,13 @@ async function refresh() {
     renderCosts();
     updateGauge();
   } catch (e) {
+    clearTimeout(timeoutId);
+    let msg = e.message;
+    if (e.name === 'AbortError') {
+      msg = 'Timeout (>8s)';
+    }
     dot.className = 'status-dot';
-    lastUpdated.textContent = `Erreur: ${e.message}`;
+    lastUpdated.textContent = `Erreur: ${msg}`;
   }
 }
 
