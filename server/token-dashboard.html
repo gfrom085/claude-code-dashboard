@@ -326,12 +326,13 @@ let prevCacheTs = null;
 let targetRate = 0;        // M tok/min — raw from last poll
 let displayRate = 0;       // M tok/min — what the needle shows (animated)
 let peakRate = 0;
-let lastFrameTs = 0;
-let gaugeAnimRunning = false;
-let gaugeIdleFrames = 0;
-const GAUGE_MAX = 100;     // M tok/min — scale max
-const DECAY_HALF_LIFE = 8000;  // ms — needle halves every 8s (~30s to near-zero)
+let lastGaugeTs = null;
+let gaugeIntervalId = null;
+const GAUGE_MAX = 1000;    // M tok/min — scale max
+const DECAY_HALF_LIFE = 30000; // ms — needle halves every 30s (gentle fade)
 const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
+const ATTACK_TAU = 5000;       // ms — ramp-up reaches ~95% in 5s (matches poll interval)
+const ATTACK_K = 3 / ATTACK_TAU; // 3 time constants ≈ 95%
 
 // Cached gauge stats for display between polls
 let gaugeActiveSessions = 0;
@@ -426,62 +427,47 @@ function drawGauge(rate) {
   ctx.font = '11px Inter, system-ui, sans-serif';
   ctx.fillStyle = '#64748b';
   ctx.textAlign = 'center';
-  for (const v of [0, 10, 25, 50, 75, 100]) {
+  for (const v of [0, 100, 250, 500, 750, 1000]) {
     const a = startAngle + (v / GAUGE_MAX) * Math.PI;
     ctx.fillText(v + '', cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16) + 4);
   }
 }
 
-// ── Animation loop (requestAnimationFrame) ──────────────────────────────────
-function gaugeAnimFrame(ts) {
-  if (!lastFrameTs) { lastFrameTs = ts; }
-  const dt = ts - lastFrameTs;
-  lastFrameTs = ts;
+// ── Gauge animation via setInterval (works in background tabs) ──────────────
+const GAUGE_TICK_MS = 50;  // 20fps — smooth enough for a gauge needle
+
+function gaugeTick() {
+  const now = performance.now();
+  if (lastGaugeTs === null) { lastGaugeTs = now; }
+  const dt = now - lastGaugeTs;
+  lastGaugeTs = now;
 
   if (dt > 0 && dt < 1000) {
-    // Instant attack: if target > display, snap up immediately
+    // Smooth ramp-up over ~5s
     if (targetRate > displayRate) {
-      displayRate = targetRate;
+      displayRate += (targetRate - displayRate) * (1 - Math.exp(-ATTACK_K * dt));
     }
-    // Exponential decay toward 0 (or toward targetRate if it's sustained)
-    // Decay only the portion above targetRate
+    // Exponential decay (half-life 30s)
     if (displayRate > targetRate) {
       const excess = displayRate - targetRate;
       displayRate = targetRate + excess * Math.exp(-DECAY_K * dt);
     }
-    // Clamp tiny values to 0 for clean display
     if (displayRate < 0.05) displayRate = 0;
   }
 
   drawGauge(displayRate);
 
-  // Idle detection: stop animation after 2s of inactivity
-  if (displayRate < 0.01 && targetRate === 0) {
-    gaugeIdleFrames++;
-    if (gaugeIdleFrames > 120) {
-      gaugeAnimRunning = false;
-      return;
-    }
-  } else {
-    gaugeIdleFrames = 0;
-  }
-
-  // Update text at ~10fps to avoid DOM thrash
-  if (dt > 100 || !lastFrameTs) {
-    document.getElementById('gaugeValue').innerHTML =
-      `${displayRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
-    const costMin = displayRate * 0.30;
-    document.getElementById('gaugeCostMin').textContent =
-      costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
-  }
-
-  requestAnimationFrame(gaugeAnimFrame);
+  document.getElementById('gaugeValue').innerHTML =
+    `${displayRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
+  const costMin = displayRate * 0.30;
+  document.getElementById('gaugeCostMin').textContent =
+    costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
 }
 
 function startGaugeAnim() {
-  if (!gaugeAnimRunning) {
-    gaugeAnimRunning = true;
-    requestAnimationFrame(gaugeAnimFrame);
+  if (!gaugeIntervalId) {
+    lastGaugeTs = null;
+    gaugeIntervalId = setInterval(gaugeTick, GAUGE_TICK_MS);
   }
 }
 
