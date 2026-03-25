@@ -511,7 +511,6 @@ def update_sidecar(
     turn_n: int,
     usage: dict,
     ts: float,
-    task_count: int = 0,
     model: str | None = None,
 ) -> None:
     """Update sidecar dict in-place with token metrics for a turn.

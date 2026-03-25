@@ -125,8 +125,7 @@ def scan_task_counts() -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        # Suppress default access logs (too noisy)
+    def log_message(self, format, *args):  # noqa: A002
         pass
 
     def send_json(self, data: dict | list, status: int = 200) -> None:
