@@ -328,6 +328,7 @@ let displayRate = 0;       // M tok/min — what the needle shows (animated)
 let peakRate = 0;
 let lastFrameTs = 0;
 let gaugeAnimRunning = false;
+let gaugeIdleFrames = 0;
 const GAUGE_MAX = 100;     // M tok/min — scale max
 const DECAY_HALF_LIFE = 8000;  // ms — needle halves every 8s (~30s to near-zero)
 const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
