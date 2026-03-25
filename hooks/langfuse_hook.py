@@ -36,11 +36,23 @@ DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
 
 # Cache pricing (USD per token) — for delta calculation only
-# Reference: claude-sonnet input = $3.00/MTok
-CACHE_BASE_PRICE_PER_TOKEN = 3.00 / 1_000_000
-CACHE_READ_PRICE_PER_TOKEN = 0.30 / 1_000_000        # 0.1x input
-CACHE_CREATE_5M_PRICE_PER_TOKEN = 3.75 / 1_000_000   # 1.25x input (ephemeral 5m)
-CACHE_CREATE_1H_PRICE_PER_TOKEN = 6.00 / 1_000_000   # 2.0x input (extended 1h)
+# Model-specific pricing for cache operations
+PRICES_PER_TOKEN = {
+    "claude-sonnet-4-6": {
+        "input": 3.00 / 1_000_000,
+        "cache_read": 0.30 / 1_000_000,
+        "cache_write_5m": 3.75 / 1_000_000,
+        "cache_write_1h": 6.00 / 1_000_000,
+    },
+    "claude-opus-4-6": {
+        "input": 15.00 / 1_000_000,
+        "cache_read": 1.50 / 1_000_000,
+        "cache_write_5m": 18.75 / 1_000_000,
+        "cache_write_1h": 30.00 / 1_000_000,
+    },
+}
+# Default fallback (Sonnet pricing)
+DEFAULT_MODEL = "claude-sonnet-4-6"
 TEAM_WINDOW_SECONDS = 300  # seconds gap for concurrent agent detection
 
 
@@ -449,6 +461,7 @@ def update_sidecar(
     usage: dict,
     ts: float,
     task_count: int = 0,
+    model: str | None = None,
 ) -> None:
     """Update sidecar dict in-place with token metrics for a turn.
 
@@ -456,14 +469,20 @@ def update_sidecar(
     - cache_savings_usd: money saved by reading from cache vs paying full input price
     - cache_surcharge_usd: extra cost of cache creation vs base input price
     """
+    # Get model-specific pricing (default to Sonnet)
+    model_key = model or DEFAULT_MODEL
+    if model_key not in PRICES_PER_TOKEN:
+        model_key = DEFAULT_MODEL
+    prices = PRICES_PER_TOKEN[model_key]
+
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_creation = usage.get("cache_creation_input_tokens", 0)
     cache_5m = usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
     cache_1h = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
 
-    savings = cache_read * (CACHE_BASE_PRICE_PER_TOKEN - CACHE_READ_PRICE_PER_TOKEN)
-    surcharge_5m = cache_5m * (CACHE_CREATE_5M_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
-    surcharge_1h = cache_1h * (CACHE_CREATE_1H_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+    savings = cache_read * (prices["input"] - prices["cache_read"])
+    surcharge_5m = cache_5m * (prices["cache_write_5m"] - prices["input"])
+    surcharge_1h = cache_1h * (prices["cache_write_1h"] - prices["input"])
     surcharge = surcharge_5m + surcharge_1h
 
     # Fork cache reuse: at turn 1, compute ratio cache_read / parent total cache

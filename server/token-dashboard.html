@@ -199,6 +199,7 @@
 <header>
   <div class="status-dot" id="dot"></div>
   <h1>Claude Code — Token Cache Dashboard</h1>
+  <button class="btn-ghost" onclick="runCacheAudit()">Cache Audit</button>
   <span class="last-updated" id="lastUpdated">—</span>
 </header>
 
@@ -228,6 +229,11 @@
         <span class="gauge-stat-value warm" id="gaugeCostMin">$0</span>
       </div>
     </div>
+  </div>
+
+  <!-- Cache Audit Results -->
+  <div id="cacheAuditResults" style="display:none" class="gauge-section">
+    <pre id="cacheAuditPre" style="font-size:12px; color:var(--text); white-space:pre-wrap; max-height:400px; overflow-y:auto;"></pre>
   </div>
 
   <!-- S1: Active Sessions -->
@@ -827,7 +833,7 @@ function renderChart() {
     },
     {
       label: 'Cache 1h Write',
-      data: sorted.map(t => Math.max(0, (t.cache_1h||0) - (t.cache_5m||0))),
+      data: sorted.map(t => t.cache_1h || 0),
       backgroundColor: 'rgba(59,130,246,0.5)',
       borderColor: 'rgba(59,130,246,0.8)',
       fill: true, tension: 0.3,
@@ -1066,6 +1072,21 @@ function moveTT(e) {
 }
 function hideTT() { document.getElementById('turn-tooltip').style.display = 'none'; }
 document.addEventListener('mousemove', moveTT);
+
+// Cache Audit function
+async function runCacheAudit() {
+  const el = document.getElementById('cacheAuditResults');
+  const pre = document.getElementById('cacheAuditPre');
+  el.style.display = 'block';
+  pre.textContent = 'Running audit...';
+  try {
+    const res = await fetch('/api/cache-audit');
+    const data = await res.json();
+    pre.textContent = JSON.stringify(data, null, 2);
+  } catch(e) {
+    pre.textContent = 'Error: ' + e.message;
+  }
+}
 </script>
 <div id="turn-tooltip"></div>
 </body>

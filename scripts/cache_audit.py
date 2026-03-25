@@ -400,7 +400,7 @@ def classify_event(
     # Use first_cache_read for drop detection: reflects cold cache state at turn start
     # (before tool-use API calls rebuild the cache within the turn)
     read_dropped = curr.first_cache_read < prev.cache_read * DROP_THRESHOLD
-    write_up = curr.first_cache_creation > prev.cache_read * 0.5  # significant rewrite
+    write_up = curr.first_cache_creation > prev.first_cache_creation * 0.5  # significant rewrite
     write_down = curr.first_cache_creation < prev.first_cache_creation * 0.5
 
     # Check for compact boundary
@@ -416,7 +416,7 @@ def classify_event(
     has_local_command = len(local_cmds) > 0
     has_meta_injection = len(meta_users) > 0
 
-    if delta_s > TTL_BOUNDARY:
+    if delta_s >= TTL_BOUNDARY:
         return "TTL_EXPIRED", f"TTL expiry ({delta_s / 3600:.1f}h gap)"
 
     if read_dropped and write_up and (has_local_command or has_meta_injection):
@@ -564,10 +564,7 @@ def analyze_session(
                 (1 - curr.first_cache_read / prev.cache_read) * 100, 1
             )
             # Cost based on first_cache_creation (the rewrite caused by invalidation)
-            prices = get_prices(curr.model)
-            rewrite_cost = round(
-                curr.first_cache_creation * prices["cache_write_1h"] / 1_000_000, 6
-            )
+            rewrite_cost = compute_rewrite_cost(curr)
 
             events.append(CacheEvent(
                 session_id=session_id,

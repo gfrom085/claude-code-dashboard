@@ -11,6 +11,7 @@ import itertools
 import json
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +20,10 @@ SIDECAR_FILE = Path("/tmp/langfuse-token-metrics.json")
 DASHBOARD_FILE = Path(__file__).parent / "token-dashboard.html"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+
+# Task cache with 30s TTL
+_task_cache: dict = {"data": {}, "ts": 0.0}
+TASK_CACHE_TTL = 30.0
 
 
 def scan_task_counts() -> dict:
@@ -160,7 +165,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({})
 
         elif path == "/api/task-counts":
-            self.send_json(scan_task_counts())
+            now = time.time()
+            if now - _task_cache["ts"] > TASK_CACHE_TTL:
+                _task_cache["data"] = scan_task_counts()
+                _task_cache["ts"] = now
+            self.send_json(_task_cache["data"])
 
         elif path == "/api/cache-audit":
             self._handle_cache_audit()
