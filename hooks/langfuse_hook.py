@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -108,9 +109,25 @@ def check_langfuse_health(host: str) -> bool:
 
 
 def queue_trace(trace_data: dict) -> None:
-    """Append a trace to the local queue file."""
+    """Append a trace to the local queue file.
+
+    Checks queue file size before appending. If queue exceeds 10MB, logs warning and skips.
+    """
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check queue file size
+    try:
+        if QUEUE_FILE.exists():
+            file_size = QUEUE_FILE.stat().st_size
+            if file_size > 10 * 1_000_000:  # 10MB
+                log("WARN", f"Queue file too large ({file_size / 1_000_000:.1f}MB), skipping trace")
+                return
+    except OSError as e:
+        debug(f"Error checking queue file size: {e}")
+        return
+
     trace_data["queued_at"] = datetime.now(timezone.utc).isoformat()
+    trace_data["retry_count"] = trace_data.get("retry_count", 0)
     with open(QUEUE_FILE, "a") as f:
         f.write(json.dumps(trace_data) + "\n")
     log("INFO", f"Queued trace for session {trace_data.get('session_id', 'unknown')}, turn {trace_data.get('turn_num', '?')}")
@@ -143,7 +160,10 @@ def clear_queue() -> None:
 
 
 def drain_queue(langfuse: Langfuse) -> int:
-    """Drain all queued traces to Langfuse. Returns count of drained traces."""
+    """Drain all queued traces to Langfuse. Returns count of drained traces.
+
+    Tracks retry count per trace. Drops traces that exceed 3 retries.
+    """
     traces = load_queued_traces()
     if not traces:
         return 0
@@ -151,7 +171,16 @@ def drain_queue(langfuse: Langfuse) -> int:
     log("INFO", f"Draining {len(traces)} queued traces to Langfuse")
 
     drained = 0
+    dropped = 0
     for trace_data in traces:
+        retry_count = trace_data.get("retry_count", 0)
+
+        # Drop traces that have been retried too many times
+        if retry_count >= 3:
+            log("WARN", f"Dropping trace (session={trace_data.get('session_id')}, turn={trace_data.get('turn_num')}) after 3 retries")
+            dropped += 1
+            continue
+
         try:
             create_trace(
                 langfuse=langfuse,
@@ -165,15 +194,17 @@ def drain_queue(langfuse: Langfuse) -> int:
             drained += 1
         except Exception as e:
             log("ERROR", f"Failed to drain trace: {e}")
-            # If we fail mid-drain, rewrite remaining traces and exit
+            # If we fail mid-drain, rewrite remaining traces and increment retry count
             remaining = traces[drained:]
             clear_queue()
             for remaining_trace in remaining:
+                remaining_trace["retry_count"] = remaining_trace.get("retry_count", 0) + 1
                 queue_trace(remaining_trace)
+            log("INFO", f"Drained {drained} traces before failure, requeued {len(remaining)} with incremented retry counts")
             return drained
 
     clear_queue()
-    log("INFO", f"Successfully drained {drained} traces")
+    log("INFO", f"Successfully drained {drained} traces ({dropped} dropped after max retries)")
     return drained
 
 
@@ -367,24 +398,44 @@ def load_sidecar() -> dict:
 def acquire_sidecar_lock():
     """Acquire exclusive lock for the full sidecar read-modify-write cycle.
 
+    Uses non-blocking lock with 3 retry attempts. If lock cannot be acquired,
+    returns None and caller should skip the operation.
+
     Usage:
         lock_fd = acquire_sidecar_lock()
         try:
-            sidecar = load_sidecar()
-            # ... modify sidecar ...
-            save_sidecar(sidecar)
+            if lock_fd:
+                sidecar = load_sidecar()
+                # ... modify sidecar ...
+                save_sidecar(sidecar)
         finally:
-            release_sidecar_lock(lock_fd)
+            if lock_fd:
+                release_sidecar_lock(lock_fd)
     """
+    SIDECAR_LOCK.parent.mkdir(parents=True, exist_ok=True)
     lf = open(SIDECAR_LOCK, "w")
-    fcntl.flock(lf, fcntl.LOCK_EX)
-    return lf
+    for _attempt in range(3):
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lf
+        except BlockingIOError:
+            if _attempt == 2:
+                debug("Lock acquisition failed after 3 attempts, skipping")
+                lf.close()
+                return None
+            _time.sleep(0.1)
+    return None
 
 
 def release_sidecar_lock(lf):
-    """Release the sidecar lock."""
-    fcntl.flock(lf, fcntl.LOCK_UN)
-    lf.close()
+    """Release the sidecar lock. Handles None gracefully if lock was not acquired."""
+    if lf is None:
+        return
+    try:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+    except Exception:
+        pass  # Already closed or other error
 
 
 def reconcile_sidecar(sidecar: dict) -> int:
@@ -835,6 +886,12 @@ def create_trace(
     usage_details = None
     cost_details = None
     if usage:
+        # Get model-specific pricing
+        model_key = model or DEFAULT_MODEL
+        if model_key not in PRICES_PER_TOKEN:
+            model_key = DEFAULT_MODEL
+        prices = PRICES_PER_TOKEN[model_key]
+
         cache_read = usage.get("cache_read_input_tokens", 0)
         cache_creation = usage.get("cache_creation_input_tokens", 0)
         usage_details = {
@@ -847,9 +904,9 @@ def create_trace(
         }
         cache_5m_t = usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
         cache_1h_t = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
-        savings = cache_read * (CACHE_BASE_PRICE_PER_TOKEN - CACHE_READ_PRICE_PER_TOKEN)
-        surcharge_5m = cache_5m_t * (CACHE_CREATE_5M_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
-        surcharge_1h = cache_1h_t * (CACHE_CREATE_1H_PRICE_PER_TOKEN - CACHE_BASE_PRICE_PER_TOKEN)
+        savings = cache_read * (prices["input"] - prices["cache_read"])
+        surcharge_5m = cache_5m_t * (prices["cache_write_5m"] - prices["input"])
+        surcharge_1h = cache_1h_t * (prices["cache_write_1h"] - prices["input"])
         cost_details = {
             "cache_savings_usd": round(savings, 6),
             "cache_surcharge_usd": round(surcharge_5m + surcharge_1h, 6),
@@ -1000,6 +1057,10 @@ def process_transcript(
             if current_user and current_assistants:
                 turns += 1
                 turn_num = turn_count + turns
+                # Extract model from first assistant message
+                msg_model = "claude"
+                if current_assistants and isinstance(current_assistants[0], dict) and "message" in current_assistants[0]:
+                    msg_model = current_assistants[0]["message"].get("model", "claude")
                 create_trace(
                     langfuse, session_id, turn_num, current_user,
                     current_assistants, current_tool_results, project_name,
@@ -1009,6 +1070,7 @@ def process_transcript(
                     update_sidecar(
                         sidecar, session_id, session_type, parent_session,
                         project_name, turn_num, current_turn_usage, file_mtime,
+                        model=msg_model,
                     )
 
             # Start new turn
@@ -1047,6 +1109,10 @@ def process_transcript(
     if current_user and current_assistants:
         turns += 1
         turn_num = turn_count + turns
+        # Extract model from first assistant message
+        msg_model = "claude"
+        if current_assistants and isinstance(current_assistants[0], dict) and "message" in current_assistants[0]:
+            msg_model = current_assistants[0]["message"].get("model", "claude")
         create_trace(
             langfuse, session_id, turn_num, current_user,
             current_assistants, current_tool_results, project_name,
@@ -1060,6 +1126,7 @@ def process_transcript(
             update_sidecar(
                 sidecar, session_id, session_type, parent_session,
                 project_name, turn_num, current_turn_usage, file_mtime,
+                model=msg_model,
             )
 
     # Update state
@@ -1113,74 +1180,94 @@ def main():
 
     debug(f"Found {len(modified_transcripts)} modified session(s) to process")
 
-    # Check if Langfuse is reachable
-    langfuse_available = check_langfuse_health(host)
+    # Always acquire sidecar lock and update sidecar, regardless of Langfuse availability
+    sidecar_lock = acquire_sidecar_lock()
+    langfuse = None
+    try:
+        # If lock couldn't be acquired, skip processing
+        if sidecar_lock is None:
+            log("WARN", "Could not acquire sidecar lock after 3 attempts, skipping sidecar update")
+            sys.exit(0)
 
-    if not langfuse_available:
-        # Queue all modified sessions
-        log("WARN", f"Langfuse unavailable at {host}, queuing traces locally")
+        sidecar = load_sidecar()
 
-        total_turns_queued = 0
-        for session_id, transcript_file, project_name in modified_transcripts:
-            # Get previous state for this session
-            session_state = state.get(session_id, {})
-            last_line = session_state.get("last_line", 0)
-            turn_count = session_state.get("turn_count", 0)
+        # Check if Langfuse is reachable
+        langfuse_available = check_langfuse_health(host)
 
-            # Read transcript
-            try:
-                lines = transcript_file.read_text().strip().split("\n")
-                total_lines = len(lines)
+        if not langfuse_available:
+            # Queue all modified sessions
+            log("WARN", f"Langfuse unavailable at {host}, queuing traces locally")
 
-                if last_line >= total_lines:
-                    continue
+            total_turns_queued = 0
+            for session_id, transcript_file, project_name in modified_transcripts:
+                # Get previous state for this session
+                session_state = state.get(session_id, {})
+                last_line = session_state.get("last_line", 0)
+                turn_count = session_state.get("turn_count", 0)
 
-                # Parse new messages and queue turns
-                new_messages = []
-                for i in range(last_line, total_lines):
-                    try:
-                        msg = json.loads(lines[i])
-                        new_messages.append(msg)
-                    except json.JSONDecodeError:
+                # Read transcript
+                try:
+                    lines = transcript_file.read_text().strip().split("\n")
+                    total_lines = len(lines)
+
+                    if last_line >= total_lines:
                         continue
 
-                if new_messages:
-                    turns_queued = queue_turns_from_messages(
-                        new_messages, session_id, turn_count, project_name
-                    )
-                    total_turns_queued += turns_queued
+                    # Parse new messages and queue turns
+                    new_messages = []
+                    for i in range(last_line, total_lines):
+                        try:
+                            msg = json.loads(lines[i])
+                            new_messages.append(msg)
+                        except json.JSONDecodeError:
+                            continue
 
-                    # Update state even when queuing
-                    state[session_id] = {
-                        "last_line": total_lines,
-                        "turn_count": turn_count + turns_queued,
-                        "updated": datetime.now(timezone.utc).isoformat(),
-                    }
-            except Exception as e:
-                debug(f"Error queuing session {session_id}: {e}")
-                continue
+                    if new_messages:
+                        turns_queued = queue_turns_from_messages(
+                            new_messages, session_id, turn_count, project_name
+                        )
+                        total_turns_queued += turns_queued
 
-        save_state(state)
-        duration = (datetime.now() - script_start).total_seconds()
-        log("INFO", f"Queued {total_turns_queued} turns from {len(modified_transcripts)} sessions in {duration:.1f}s")
-        sys.exit(0)
+                        # Update state even when queuing
+                        state[session_id] = {
+                            "last_line": total_lines,
+                            "turn_count": turn_count + turns_queued,
+                            "updated": datetime.now(timezone.utc).isoformat(),
+                        }
+                except Exception as e:
+                    debug(f"Error queuing session {session_id}: {e}")
+                    continue
 
-    # Langfuse is available - initialize client
-    try:
-        langfuse = Langfuse(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-        )
-    except Exception as e:
-        log("ERROR", f"Failed to initialize Langfuse client: {e}")
-        sys.exit(0)
+            save_state(state)
 
-    # Exclusive lock for the full sidecar read-modify-write cycle.
-    # Prevents TOCTOU races when multiple hooks fire concurrently (SubagentStop).
-    sidecar_lock = acquire_sidecar_lock()
-    try:
-        sidecar = load_sidecar()
+            # Update sidecar even when Langfuse is down
+            if sidecar:
+                try:
+                    save_sidecar(sidecar)
+                    debug(f"Sidecar written: {len(sidecar)} sessions")
+                except Exception as e:
+                    log("ERROR", f"Failed to write sidecar: {e}")
+
+            duration = (datetime.now() - script_start).total_seconds()
+            log("INFO", f"Queued {total_turns_queued} turns from {len(modified_transcripts)} sessions in {duration:.1f}s")
+            return
+
+        # Langfuse is available - initialize client
+        try:
+            langfuse = Langfuse(
+                public_key=public_key,
+                secret_key=secret_key,
+                host=host,
+            )
+        except Exception as e:
+            log("ERROR", f"Failed to initialize Langfuse client: {e}")
+            # Write sidecar before exit
+            if sidecar:
+                try:
+                    save_sidecar(sidecar)
+                except Exception as se:
+                    log("ERROR", f"Failed to write sidecar: {se}")
+            return
 
         # First, drain any queued traces
         drained = drain_queue(langfuse)
@@ -1234,7 +1321,8 @@ def main():
         debug(traceback.format_exc())
     finally:
         release_sidecar_lock(sidecar_lock)
-        langfuse.shutdown()
+        if langfuse:
+            langfuse.shutdown()
 
     sys.exit(0)
 
