@@ -130,7 +130,7 @@ class SessionMetrics:
     invalidation_rate: float
     tokens_wasted: int
     wasted_cost_usd: float
-    counterfactual_savings_usd: float
+    invalidation_extra_cost_usd: float
     efficiency_pct: float
 
 
@@ -471,7 +471,7 @@ def compute_session_metrics(
             session_id=session_id, project=project, model=DEFAULT_MODEL,
             total_turns=0, total_invalidations=0, invalidation_rate=0.0,
             tokens_wasted=0, wasted_cost_usd=0.0,
-            counterfactual_savings_usd=0.0, efficiency_pct=100.0,
+            invalidation_extra_cost_usd=0.0, efficiency_pct=100.0,
         )
 
     model = turns[0].model
@@ -491,11 +491,11 @@ def compute_session_metrics(
     # Cost of rewrites
     wasted_cost = sum(e.rewrite_cost_usd for e in actionable_events)
 
-    # Counterfactual: if those tokens had been read instead of rewritten
+    # Extra cost of invalidation: tokens were rewritten (expensive) instead of read (cheap)
     prices = get_prices(model)
     read_rate = prices["cache_read"] / 1_000_000
     write_rate = prices["cache_write_1h"] / 1_000_000  # conservative: assume 1h
-    counterfactual_savings = tokens_wasted * (write_rate - read_rate)
+    invalidation_extra_cost = tokens_wasted * (write_rate - read_rate)
 
     # Efficiency: total cache_read tokens / (total cache_read + total cache_creation)
     total_read = sum(t.cache_read for t in turns)
@@ -512,7 +512,7 @@ def compute_session_metrics(
         invalidation_rate=round(invalidation_rate, 3),
         tokens_wasted=tokens_wasted,
         wasted_cost_usd=round(wasted_cost, 6),
-        counterfactual_savings_usd=round(counterfactual_savings, 6),
+        invalidation_extra_cost_usd=round(invalidation_extra_cost, 6),
         efficiency_pct=round(efficiency, 1),
     )
 
@@ -680,7 +680,7 @@ def metrics_to_dict(m: SessionMetrics) -> dict:
         "invalidation_rate": m.invalidation_rate,
         "tokens_wasted": m.tokens_wasted,
         "wasted_cost_usd": m.wasted_cost_usd,
-        "counterfactual_savings_usd": m.counterfactual_savings_usd,
+        "invalidation_extra_cost_usd": m.invalidation_extra_cost_usd,
         "efficiency_pct": m.efficiency_pct,
     }
 
@@ -693,7 +693,7 @@ def format_human(events: list[CacheEvent], metrics: SessionMetrics) -> str:
     lines.append(f"Model: {metrics.model}")
     lines.append(f"Turns: {metrics.total_turns} | Invalidations: {metrics.total_invalidations} | Rate: {metrics.invalidation_rate:.1%}")
     lines.append(f"Tokens wasted: {metrics.tokens_wasted:,} | Cost: ${metrics.wasted_cost_usd:.4f}")
-    lines.append(f"Counterfactual savings: ${metrics.counterfactual_savings_usd:.4f}")
+    lines.append(f"Invalidation extra cost: ${metrics.invalidation_extra_cost_usd:.4f}")
     lines.append(f"Cache efficiency: {metrics.efficiency_pct:.1f}%")
     lines.append("")
 

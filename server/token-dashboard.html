@@ -225,7 +225,7 @@
         <span class="gauge-stat-value hot" id="gaugePeakSession">—</span>
       </div>
       <div class="gauge-stat-row">
-        <span class="gauge-stat-label">Coût cache/min</span>
+        <span class="gauge-stat-label">Coût read/min</span>
         <span class="gauge-stat-value warm" id="gaugeCostMin">$0</span>
       </div>
     </div>
@@ -525,6 +525,7 @@ function updateGauge() {
     const prev = turns[turns.length - 2];
     if (last.ts && prev.ts && last.ts > prev.ts) {
       const dt = (last.ts - prev.ts) / 60;
+      if (dt < 0.001) continue;
       const r = (last.cache_read || 0) / dt / 1e6;
       if (r > peakSessionRate) { peakSessionRate = r; peakSid = sid.substring(0, 8); }
     }
