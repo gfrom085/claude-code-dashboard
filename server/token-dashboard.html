@@ -326,7 +326,7 @@ let sseActive = false;
 
 // ── Polyphonic pulse model — each API call = independent pulse ───────────────
 const pulses = [];             // [{tokens, ts}, ...] — ts in ms (performance.now)
-const PULSE_RAMP_MS = 1500;   // ramp-up τ — reaches ~95% in 4.5s (3τ)
+const PULSE_RAMP_MS = 500;    // ramp-up τ — reaches ~95% in 1.5s (3τ)
 const PULSE_DECAY_HL = 4000;  // decay half-life 4s — pulse halves every 4s
 const PULSE_DECAY_K = Math.LN2 / PULSE_DECAY_HL;
 const PULSE_DEAD = 0.005;     // cleanup threshold — pulse < 0.5% of peak
