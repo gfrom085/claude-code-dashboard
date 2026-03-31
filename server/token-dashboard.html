@@ -336,7 +336,7 @@ let displayRate = 0;       // M tok/min — what the needle shows (animated)
 let peakRate = 0;
 let lastGaugeTs = null;
 let gaugeIntervalId = null;
-let GAUGE_MAX = 100;       // M tok/min — dynamic scale, starts at 100
+let GAUGE_MAX = 10;        // M tok/min — dynamic scale, starts at 10
 let _gaugeScaleDownCount = 0;
 const DECAY_HALF_LIFE = 30000; // ms — needle halves every 30s (gentle fade)
 const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
@@ -549,10 +549,10 @@ function updateGauge() {
   if (rawRate > GAUGE_MAX * 0.7) {
     GAUGE_MAX = Math.ceil(rawRate / 100) * 100 * 2;  // round up to next 100, then 2x headroom
     _gaugeScaleDownCount = 0;
-  } else if (rawRate < GAUGE_MAX * 0.2 && GAUGE_MAX > 100) {
+  } else if (rawRate < GAUGE_MAX * 0.2 && GAUGE_MAX > 10) {
     _gaugeScaleDownCount = (_gaugeScaleDownCount || 0) + 1;
     if (_gaugeScaleDownCount >= 6) {
-      GAUGE_MAX = Math.max(100, Math.ceil(rawRate / 50) * 50 * 2 || 100);
+      GAUGE_MAX = Math.max(10, Math.ceil(rawRate / 5) * 5 * 2 || 10);
       _gaugeScaleDownCount = 0;
     }
   } else {
