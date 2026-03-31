@@ -192,13 +192,22 @@ class Handler(BaseHTTPRequestHandler):
         """Stream token metrics via Server-Sent Events.
 
         Tails /tmp/token-metrics-stream.jsonl and pushes new lines as events.
-        Sends heartbeat every SSE_HEARTBEAT_S seconds to keep the connection alive.
+        Uses raw socket sendall to bypass BufferedWriter buffering.
         """
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        import socket as _socket
+        self.request.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+
+        # Send HTTP headers via raw socket to avoid wfile buffering
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        )
+        self.request.sendall(header.encode())
+
+        sock = self.request  # raw socket for unbuffered writes
 
         pos = 0
         inode = 0
@@ -225,13 +234,11 @@ class Handler(BaseHTTPRequestHandler):
                             pos = f.tell()
                         for line in new_data.strip().split("\n"):
                             if line.strip():
-                                self.wfile.write(f"event: token\ndata: {line}\n\n".encode())
-                        self.wfile.flush()
+                                sock.sendall(f"event: token\ndata: {line}\n\n".encode())
 
                 now = time.time()
                 if now - last_heartbeat >= SSE_HEARTBEAT_S:
-                    self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
+                    sock.sendall(b": heartbeat\n\n")
                     last_heartbeat = now
 
                 time.sleep(0.5)
