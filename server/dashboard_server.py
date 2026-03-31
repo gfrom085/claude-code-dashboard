@@ -14,16 +14,21 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
 SIDECAR_FILE = Path("/tmp/langfuse-token-metrics.json")
 DASHBOARD_FILE = Path(__file__).parent / "token-dashboard.html"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+METRICS_STREAM = Path("/tmp/token-metrics-stream.jsonl")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 
 # Task cache with 30s TTL
 _task_cache: dict = {"data": {}, "ts": 0.0}
 TASK_CACHE_TTL = 30.0
+
+# SSE heartbeat interval
+SSE_HEARTBEAT_S = 15
 
 
 def scan_task_counts() -> dict:
@@ -173,11 +178,65 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/cache-audit":
             self._handle_cache_audit()
 
+        elif path == "/api/stream":
+            self._handle_sse()
+
         elif path == "/api/health":
-            self.send_json({"ok": True, "sidecar_exists": SIDECAR_FILE.exists()})
+            self.send_json({"ok": True, "sidecar_exists": SIDECAR_FILE.exists(),
+                            "metrics_stream_exists": METRICS_STREAM.exists()})
 
         else:
             self.send_json({"error": "not found"}, 404)
+
+    def _handle_sse(self) -> None:
+        """Stream token metrics via Server-Sent Events.
+
+        Tails /tmp/token-metrics-stream.jsonl and pushes new lines as events.
+        Sends heartbeat every SSE_HEARTBEAT_S seconds to keep the connection alive.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        pos = 0
+        inode = 0
+        if METRICS_STREAM.exists():
+            stat = METRICS_STREAM.stat()
+            pos = stat.st_size  # start from end (only new data)
+            inode = stat.st_ino
+
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                # Check if file was rotated (inode changed or file shrank)
+                if METRICS_STREAM.exists():
+                    stat = METRICS_STREAM.stat()
+                    if stat.st_ino != inode or stat.st_size < pos:
+                        pos = 0
+                        inode = stat.st_ino
+
+                    if stat.st_size > pos:
+                        with open(METRICS_STREAM) as f:
+                            f.seek(pos)
+                            new_data = f.read()
+                            pos = f.tell()
+                        for line in new_data.strip().split("\n"):
+                            if line.strip():
+                                self.wfile.write(f"event: token\ndata: {line}\n\n".encode())
+                        self.wfile.flush()
+
+                now = time.time()
+                if now - last_heartbeat >= SSE_HEARTBEAT_S:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = now
+
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # client disconnected
 
     def _handle_cache_audit(self) -> None:
         """Run cache_audit.py and return results as JSON."""
@@ -232,8 +291,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 500)
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 def main():
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Dashboard server running at http://localhost:{PORT}")
     print(f"Sidecar: {SIDECAR_FILE}")
     print(f"Dashboard: {DASHBOARD_FILE}")

@@ -320,6 +320,14 @@ let showDismissed = false;
 let groupByProject = true;  // default: grouped
 const collapsedGroups = new Set();
 
+// ── SSE state — real-time token metrics from mitmproxy ──────────────────────
+let sseSource = null;
+let sseActive = false;
+let ssePrevTokens = null;
+let ssePrevTs = null;
+const SSE_EMA_ALPHA = 0.2;  // α=0.2 → half-life ~3 samples
+let sseEmaRate = 0;         // M tok/min — EMA smoothed from SSE
+
 // ── Gauge state — VU-meter: instant attack, 30s exponential decay ───────────
 let prevCacheTotal = null;
 let prevCacheTs = null;
@@ -474,6 +482,45 @@ function startGaugeAnim() {
   }
 }
 
+// ── SSE: real-time gauge feed from mitmproxy metrics_addon ──────────────────
+function initSSE() {
+  if (sseSource) return;
+  try {
+    sseSource = new EventSource('/api/stream');
+    sseSource.addEventListener('token', (e) => {
+      sseActive = true;
+      try {
+        const d = JSON.parse(e.data);
+        const tokens = (d.cache_read || 0) + (d.cache_creation || 0) + (d.input || 0);
+        const ts = d.ts || (Date.now() / 1000);
+        if (ssePrevTokens !== null && ssePrevTs !== null) {
+          const dtSec = ts - ssePrevTs;
+          if (dtSec > 0.1) {
+            const rawRate = tokens / dtSec * 60 / 1e6;  // M tok/min for this sample
+            sseEmaRate = SSE_EMA_ALPHA * rawRate + (1 - SSE_EMA_ALPHA) * sseEmaRate;
+            targetRate = sseEmaRate;
+          }
+        }
+        ssePrevTokens = tokens;
+        ssePrevTs = ts;
+      } catch (_) { /* ignore malformed */ }
+    });
+    sseSource.onerror = () => {
+      sseActive = false;
+      sseSource.close();
+      sseSource = null;
+      ssePrevTokens = null;
+      ssePrevTs = null;
+      sseEmaRate = 0;
+      // Retry in 10s — poll gauge takes over in the meantime
+      setTimeout(initSSE, 10000);
+    };
+  } catch (_) {
+    sseActive = false;
+  }
+}
+initSSE();
+
 // ── Called from refresh() — computes raw rate from poll data ─────────────────
 function updateGauge() {
   const active = getActiveSessions();
@@ -492,8 +539,10 @@ function updateGauge() {
   prevCacheTotal = totalCacheRead;
   prevCacheTs = tsNow;
 
-  // Set target — animation loop handles the rest
-  targetRate = rawRate;
+  // Set target — SSE takes priority when active, poll is fallback
+  if (!sseActive) {
+    targetRate = rawRate;
+  }
   if (rawRate > peakRate) peakRate = rawRate;
 
   // Dynamic scale: grow if rate > 70% of max, shrink if < 20% for 6 polls (30s)
