@@ -323,25 +323,23 @@ const collapsedGroups = new Set();
 // ── SSE state — real-time token metrics from mitmproxy ──────────────────────
 let sseSource = null;
 let sseActive = false;
-let ssePrevTokens = null;
-let ssePrevTs = null;
-const SSE_EMA_ALPHA = 0.2;  // α=0.2 → half-life ~3 samples
-let sseEmaRate = 0;         // M tok/min — EMA smoothed from SSE
 
-// ── Gauge state — VU-meter: instant attack, 30s exponential decay ───────────
+// ── Polyphonic pulse model — each API call = independent pulse ───────────────
+const pulses = [];             // [{tokens, ts}, ...] — ts in ms (performance.now)
+const PULSE_RAMP_MS = 1500;   // ramp-up τ — reaches ~95% in 4.5s (3τ)
+const PULSE_DECAY_HL = 8000;  // decay half-life 8s — pulse halves every 8s
+const PULSE_DECAY_K = Math.LN2 / PULSE_DECAY_HL;
+const PULSE_DEAD = 0.005;     // cleanup threshold — pulse < 0.5% of peak
+
+// ── Gauge state ─────────────────────────────────────────────────────────────
 let prevCacheTotal = null;
 let prevCacheTs = null;
-let targetRate = 0;        // M tok/min — raw from last poll
-let displayRate = 0;       // M tok/min — what the needle shows (animated)
+let displayRate = 0;       // M tok/min — what the needle shows
 let peakRate = 0;
 let lastGaugeTs = null;
 let gaugeIntervalId = null;
-let GAUGE_MAX = 10;        // M tok/min — dynamic scale, starts at 10
+let GAUGE_MAX = 2;         // M tok/min — dynamic scale, starts at 2
 let _gaugeScaleDownCount = 0;
-const DECAY_HALF_LIFE = 30000; // ms — needle halves every 30s (gentle fade)
-const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
-const ATTACK_TAU = 5000;       // ms — ramp-up reaches ~95% in 5s (matches poll interval)
-const ATTACK_K = 3 / ATTACK_TAU; // 3 time constants ≈ 95%
 
 // Cached gauge stats for display between polls
 let gaugeActiveSessions = 0;
@@ -444,27 +442,29 @@ function drawGauge(rate) {
   }
 }
 
-// ── Gauge animation via setInterval (works in background tabs) ──────────────
-const GAUGE_TICK_MS = 50;  // 20fps — smooth enough for a gauge needle
+// ── Gauge animation — polyphonic: sum of independent pulses ─────────────────
+const GAUGE_TICK_MS = 50;  // 20fps
 
 function gaugeTick() {
   const now = performance.now();
-  if (lastGaugeTs === null) { lastGaugeTs = now; }
-  const dt = now - lastGaugeTs;
-  lastGaugeTs = now;
 
-  if (dt > 0 && dt < 1000) {
-    // Smooth ramp-up over ~5s
-    if (targetRate > displayRate) {
-      displayRate += (targetRate - displayRate) * (1 - Math.exp(-ATTACK_K * dt));
+  // Sum all active pulses: each has its own ramp × decay envelope
+  let totalRate = 0;
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    const age = now - p.ts;
+    const ramp = 1 - Math.exp(-age / PULSE_RAMP_MS);       // rises to ~95% in 4.5s
+    const decay = Math.exp(-PULSE_DECAY_K * age);           // halves every 8s
+    const val = p.rate * ramp * decay;
+    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) {
+      pulses.splice(i, 1);  // dead pulse, remove
+    } else {
+      totalRate += val;
     }
-    // Exponential decay (half-life 30s)
-    if (displayRate > targetRate) {
-      const excess = displayRate - targetRate;
-      displayRate = targetRate + excess * Math.exp(-DECAY_K * dt);
-    }
-    if (displayRate < 0.05) displayRate = 0;
   }
+
+  displayRate = totalRate;
+  if (displayRate < 0.01) displayRate = 0;
 
   drawGauge(displayRate);
 
@@ -482,7 +482,7 @@ function startGaugeAnim() {
   }
 }
 
-// ── SSE: real-time gauge feed from mitmproxy metrics_addon ──────────────────
+// ── SSE: real-time gauge feed — each sample creates a pulse ─────────────────
 function initSSE() {
   if (sseSource) return;
   try {
@@ -492,27 +492,16 @@ function initSSE() {
       try {
         const d = JSON.parse(e.data);
         const tokens = (d.cache_read || 0) + (d.cache_creation || 0) + (d.input || 0);
-        const ts = d.ts || (Date.now() / 1000);
-        if (ssePrevTokens !== null && ssePrevTs !== null) {
-          const dtSec = ts - ssePrevTs;
-          if (dtSec > 0.1) {
-            const rawRate = tokens / dtSec * 60 / 1e6;  // M tok/min for this sample
-            sseEmaRate = SSE_EMA_ALPHA * rawRate + (1 - SSE_EMA_ALPHA) * sseEmaRate;
-            targetRate = sseEmaRate;
-          }
-        }
-        ssePrevTokens = tokens;
-        ssePrevTs = ts;
+        // Convert tokens to M tok/min contribution:
+        // This pulse represents tokens/60s worth of rate (one API call's tokens spread over 1 min)
+        const rate = tokens / 1e6;  // M tokens — this pulse's peak contribution
+        pulses.push({ rate, ts: performance.now() });
       } catch (_) { /* ignore malformed */ }
     });
     sseSource.onerror = () => {
       sseActive = false;
       sseSource.close();
       sseSource = null;
-      ssePrevTokens = null;
-      ssePrevTs = null;
-      sseEmaRate = 0;
-      // Retry in 10s — poll gauge takes over in the meantime
       setTimeout(initSSE, 10000);
     };
   } catch (_) {
@@ -539,20 +528,21 @@ function updateGauge() {
   prevCacheTotal = totalCacheRead;
   prevCacheTs = tsNow;
 
-  // Set target — SSE takes priority when active, poll is fallback
-  if (!sseActive) {
-    targetRate = rawRate;
+  // Poll fallback — create pulse only if SSE is not feeding
+  if (!sseActive && rawRate > 0.01) {
+    pulses.push({ rate: rawRate, ts: performance.now() });
   }
   if (rawRate > peakRate) peakRate = rawRate;
 
-  // Dynamic scale: grow if rate > 70% of max, shrink if < 20% for 6 polls (30s)
-  if (rawRate > GAUGE_MAX * 0.7) {
-    GAUGE_MAX = Math.ceil(rawRate / 100) * 100 * 2;  // round up to next 100, then 2x headroom
+  // Dynamic scale based on displayRate (sum of all pulses)
+  const dr = displayRate;
+  if (dr > GAUGE_MAX * 0.7) {
+    GAUGE_MAX = Math.ceil(dr / 5) * 5 * 2;  // round up, 2x headroom
     _gaugeScaleDownCount = 0;
-  } else if (rawRate < GAUGE_MAX * 0.2 && GAUGE_MAX > 10) {
+  } else if (dr < GAUGE_MAX * 0.2 && GAUGE_MAX > 2) {
     _gaugeScaleDownCount = (_gaugeScaleDownCount || 0) + 1;
     if (_gaugeScaleDownCount >= 6) {
-      GAUGE_MAX = Math.max(10, Math.ceil(rawRate / 5) * 5 * 2 || 10);
+      GAUGE_MAX = Math.max(2, Math.ceil(dr * 4) || 2);
       _gaugeScaleDownCount = 0;
     }
   } else {
