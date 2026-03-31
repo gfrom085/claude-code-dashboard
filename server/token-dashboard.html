@@ -133,6 +133,12 @@
     color: var(--text); text-align: center; line-height: 1;
   }
   .gauge-unit { font-size: 11px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
+  .mini-gauges { display: flex; gap: 16px; margin-top: 12px; width: 100%; }
+  .mini-gauge { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; text-align: center; }
+  .mini-gauge canvas { width: 120px; height: 75px; }
+  .mini-gauge-wrap { position: relative; width: 120px; height: 75px; margin: 0 auto; }
+  .mini-gauge-value { position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%); font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); line-height: 1; }
+  .mini-gauge-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 4px; }
   .gauge-stats { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
   .gauge-stat-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
   .gauge-stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -231,6 +237,31 @@
     </div>
   </div>
 
+  <!-- Mini gauges: write 5m, write 1h, output -->
+  <div class="mini-gauges">
+    <div class="mini-gauge">
+      <div class="mini-gauge-wrap">
+        <canvas id="miniGauge5m" width="240" height="150"></canvas>
+        <div class="mini-gauge-value" id="miniValue5m">0</div>
+      </div>
+      <div class="mini-gauge-label">Cache Write 5m</div>
+    </div>
+    <div class="mini-gauge">
+      <div class="mini-gauge-wrap">
+        <canvas id="miniGauge1h" width="240" height="150"></canvas>
+        <div class="mini-gauge-value" id="miniValue1h">0</div>
+      </div>
+      <div class="mini-gauge-label">Cache Write 1h</div>
+    </div>
+    <div class="mini-gauge">
+      <div class="mini-gauge-wrap">
+        <canvas id="miniGaugeOut" width="240" height="150"></canvas>
+        <div class="mini-gauge-value" id="miniValueOut">0</div>
+      </div>
+      <div class="mini-gauge-label">Output</div>
+    </div>
+  </div>
+
   <!-- Cache Audit Results -->
   <div id="cacheAuditResults" style="display:none" class="gauge-section">
     <pre id="cacheAuditPre" style="font-size:12px; color:var(--text); white-space:pre-wrap; max-height:400px; overflow-y:auto;"></pre>
@@ -325,7 +356,10 @@ let sseSource = null;
 let sseActive = false;
 
 // ── Polyphonic pulse model — each API call = independent pulse ───────────────
-const pulses = [];             // [{tokens, ts}, ...] — ts in ms (performance.now)
+const pulses = [];             // [{rate, ts}, ...] — main gauge (cache_read)
+const pulses5m = [];           // cache write 5m
+const pulses1h = [];           // cache write 1h
+const pulsesOut = [];          // output tokens
 const PULSE_RAMP_MS = 500;    // ramp-up τ — reaches ~95% in 1.5s (3τ)
 const PULSE_DECAY_HL = 4000;  // decay half-life 4s — pulse halves every 4s
 const PULSE_DECAY_K = Math.LN2 / PULSE_DECAY_HL;
@@ -445,34 +479,84 @@ function drawGauge(rate) {
 // ── Gauge animation — polyphonic: sum of independent pulses ─────────────────
 const GAUGE_TICK_MS = 50;  // 20fps
 
+function sumPulses(arr, now) {
+  let total = 0;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const p = arr[i];
+    const age = now - p.ts;
+    const ramp = 1 - Math.exp(-age / PULSE_RAMP_MS);
+    const decay = Math.exp(-PULSE_DECAY_K * age);
+    const val = p.rate * ramp * decay;
+    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) {
+      arr.splice(i, 1);
+    } else {
+      total += val;
+    }
+  }
+  return total;
+}
+
+function drawMiniGauge(canvasId, rate, max, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const cx = W / 2, cy = H - 10;
+  const R = Math.min(cx - 12, cy - 6);
+  ctx.clearRect(0, 0, W, H);
+  const startAngle = Math.PI;
+  // Dim arc
+  ctx.lineWidth = 10; ctx.lineCap = 'butt';
+  ctx.beginPath(); ctx.arc(cx, cy, R, startAngle, 2 * Math.PI);
+  ctx.strokeStyle = color + '30'; ctx.stroke();
+  // Filled arc
+  const pct = Math.min(rate / max, 1);
+  if (pct > 0.005) {
+    ctx.lineWidth = 10; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(cx, cy, R, startAngle, startAngle + pct * Math.PI);
+    ctx.strokeStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 6;
+    ctx.stroke(); ctx.shadowBlur = 0;
+  }
+  // Needle
+  const needleAngle = startAngle + pct * Math.PI;
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(needleAngle) * (R - 8), cy + Math.sin(needleAngle) * (R - 8));
+  ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.stroke();
+}
+
+// Mini-gauge max scales (auto-adjusting)
+let miniMax5m = 0.5, miniMax1h = 0.5, miniMaxOut = 0.5;
+
 function gaugeTick() {
   const now = performance.now();
 
-  // Sum all active pulses: each has its own ramp × decay envelope
-  let totalRate = 0;
-  for (let i = pulses.length - 1; i >= 0; i--) {
-    const p = pulses[i];
-    const age = now - p.ts;
-    const ramp = 1 - Math.exp(-age / PULSE_RAMP_MS);       // rises to ~95% in 4.5s
-    const decay = Math.exp(-PULSE_DECAY_K * age);           // halves every 8s
-    const val = p.rate * ramp * decay;
-    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) {
-      pulses.splice(i, 1);  // dead pulse, remove
-    } else {
-      totalRate += val;
-    }
-  }
-
-  displayRate = totalRate;
+  // Main gauge — cache read
+  displayRate = sumPulses(pulses, now);
   if (displayRate < 0.01) displayRate = 0;
-
   drawGauge(displayRate);
-
   document.getElementById('gaugeValue').innerHTML =
     `${displayRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
   const costMin = displayRate * 0.30;
   document.getElementById('gaugeCostMin').textContent =
     costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
+
+  // Mini gauges
+  const rate5m = sumPulses(pulses5m, now);
+  const rate1h = sumPulses(pulses1h, now);
+  const rateOut = sumPulses(pulsesOut, now);
+
+  // Auto-scale minis
+  if (rate5m > miniMax5m * 0.7) miniMax5m = Math.ceil(rate5m * 3);
+  if (rate1h > miniMax1h * 0.7) miniMax1h = Math.ceil(rate1h * 3);
+  if (rateOut > miniMaxOut * 0.7) miniMaxOut = Math.ceil(rateOut * 3);
+
+  drawMiniGauge('miniGauge5m', rate5m, miniMax5m, '#eab308');
+  drawMiniGauge('miniGauge1h', rate1h, miniMax1h, '#f97316');
+  drawMiniGauge('miniGaugeOut', rateOut, miniMaxOut, '#8b5cf6');
+
+  document.getElementById('miniValue5m').textContent = rate5m > 0.005 ? rate5m.toFixed(2) + 'M' : '0';
+  document.getElementById('miniValue1h').textContent = rate1h > 0.005 ? rate1h.toFixed(2) + 'M' : '0';
+  document.getElementById('miniValueOut').textContent = rateOut > 0.005 ? rateOut.toFixed(2) + 'M' : '0';
 }
 
 function startGaugeAnim() {
@@ -491,11 +575,15 @@ function initSSE() {
       sseActive = true;
       try {
         const d = JSON.parse(e.data);
-        const tokens = (d.cache_read || 0) + (d.cache_creation || 0) + (d.input || 0);
-        // Convert tokens to M tok/min contribution:
-        // This pulse represents tokens/60s worth of rate (one API call's tokens spread over 1 min)
-        const rate = tokens / 1e6;  // M tokens — this pulse's peak contribution
-        pulses.push({ rate, ts: performance.now() });
+        const now = performance.now();
+        const cr = (d.cache_read || 0) / 1e6;
+        const c5 = (d.cache_5m || 0) / 1e6;
+        const c1 = (d.cache_1h || 0) / 1e6;
+        const ot = (d.output || 0) / 1e6;
+        if (cr > 0) pulses.push({ rate: cr, ts: now });
+        if (c5 > 0) pulses5m.push({ rate: c5, ts: now });
+        if (c1 > 0) pulses1h.push({ rate: c1, ts: now });
+        if (ot > 0) pulsesOut.push({ rate: ot, ts: now });
       } catch (_) { /* ignore malformed */ }
     });
     sseSource.onerror = () => {
