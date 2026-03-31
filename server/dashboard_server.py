@@ -9,26 +9,261 @@ Default port: 8765
 
 import itertools
 import json
+import os
+import socket as _socket
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
 SIDECAR_FILE = Path("/tmp/langfuse-token-metrics.json")
+SIDECAR_JSONL = Path("/tmp/langfuse-token-metrics.jsonl")
+METRICS_DATA_DIR = Path.home() / "active-projects" / "claude-code-dashboard" / "data"
 DASHBOARD_FILE = Path(__file__).parent / "token-dashboard.html"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 METRICS_STREAM = Path("/tmp/token-metrics-stream.jsonl")
+SKIPS_FILE = Path("/tmp/token-metrics-skips")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 
 # Task cache with 30s TTL
 _task_cache: dict = {"data": {}, "ts": 0.0}
 TASK_CACHE_TTL = 30.0
 
+# Thread-safe sidecar cache [red-team P2-S03]
+_sidecar_cache = {"data": {}, "ts": 0.0}
+_sidecar_cache_lock = threading.Lock()
+SIDECAR_CACHE_TTL = 30.0
+
 # SSE heartbeat interval
 SSE_HEARTBEAT_S = 15
+
+
+def read_sidecar_jsonl() -> dict:
+    """Read JSONL sidecar, aggregate by session, return dict compatible with old format.
+    Uses double-checked locking to prevent thundering herd [red-team P2-S03]."""
+    now = time.time()
+    if now - _sidecar_cache["ts"] < SIDECAR_CACHE_TTL:
+        return _sidecar_cache["data"]
+
+    with _sidecar_cache_lock:
+        # Double-check after acquiring lock
+        if now - _sidecar_cache["ts"] < SIDECAR_CACHE_TTL:
+            return _sidecar_cache["data"]
+
+        result = {}
+        seven_days_ago = now - 7 * 86400  # 7-day sliding window [red-team S5]
+
+        if SIDECAR_JSONL.exists():
+            try:
+                with open(SIDECAR_JSONL) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if d.get("ts", 0) < seven_days_ago:
+                            continue
+                        sid = d.get("sid", "")
+                        if sid not in result:
+                            result[sid] = {
+                                "type": d.get("type", "main"),
+                                "project": d.get("project", ""),
+                                "turns": [],
+                                "last_seen": d.get("ts", 0),
+                            }
+                        result[sid]["turns"].append({
+                            "n": d.get("turn", 0),
+                            "ts": d.get("ts", 0),
+                            "input": d.get("input", 0),
+                            "output": d.get("output", 0),
+                            "cache_read": d.get("cache_read", 0),
+                            "cache_creation": d.get("cache_creation", 0),
+                            "cache_5m": d.get("cache_5m", 0),
+                            "cache_1h": d.get("cache_1h", 0),
+                            "cache_savings_usd": d.get("cache_savings_usd", 0),
+                            "cache_surcharge_usd": d.get("cache_surcharge_usd", 0),
+                        })
+                        if d.get("ts", 0) > result[sid]["last_seen"]:
+                            result[sid]["last_seen"] = d["ts"]
+            except IOError:
+                pass
+
+        _sidecar_cache["data"] = result
+        _sidecar_cache["ts"] = time.time()
+        return result
+
+
+def warm_start_sidecar():
+    """Rebuild sidecar from dated JSONL if sidecar is empty [red-team P2-04]."""
+    if SIDECAR_JSONL.exists() and SIDECAR_JSONL.stat().st_size > 0:
+        return  # sidecar already has data
+    if not METRICS_DATA_DIR.exists():
+        return
+    # Find last 7 days of dated JSONL
+    for i in range(7):
+        date = datetime.now() - timedelta(days=i)
+        dated_file = METRICS_DATA_DIR / f"token-metrics-{date.strftime('%Y-%m-%d')}.jsonl"
+        if dated_file.exists():
+            try:
+                with open(dated_file) as src:
+                    fd = os.open(str(SIDECAR_JSONL), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+                    try:
+                        for line in src:
+                            d = json.loads(line.strip())
+                            sidecar_line = json.dumps({
+                                "sid": d.get("session_id", ""),
+                                "type": d.get("session_type", "main"),
+                                "project": d.get("project", ""),
+                                "turn": d.get("turn", 0),
+                                "ts": d.get("ts", 0),
+                                "input": d.get("input", 0),
+                                "output": d.get("output", 0),
+                                "cache_read": d.get("cache_read", 0),
+                                "cache_creation": d.get("cache_creation", 0),
+                                "cache_5m": d.get("cache_5m", 0),
+                                "cache_1h": d.get("cache_1h", 0),
+                            }, separators=(",", ":")) + "\n"
+                            os.write(fd, sidecar_line.encode())
+                    finally:
+                        os.close(fd)
+            except (IOError, json.JSONDecodeError):
+                continue
+    print(f"Warm-started sidecar from dated JSONL files")
+
+
+def _check_metrics_health() -> dict:
+    """Analyze both pipelines and return health status."""
+    checks = {}
+    now = time.time()
+
+    # 1. Proxy reachability [red-team R10]
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(2)
+        proxy_ok = sock.connect_ex(("127.0.0.1", 8082)) == 0
+        sock.close()
+    except Exception:
+        proxy_ok = False
+    checks["proxy_reachable"] = proxy_ok
+
+    # 2. Stream freshness + idle detection [red-team R9]
+    stream_age = None
+    if METRICS_STREAM.exists():
+        stream_age = now - METRICS_STREAM.stat().st_mtime
+    checks["stream_age_s"] = stream_age
+
+    # Check if any transcript was modified recently (idle detection)
+    projects_dir = Path.home() / ".claude" / "projects"
+    latest_transcript_mtime = 0
+    if projects_dir.exists():
+        for pd in projects_dir.iterdir():
+            if pd.is_dir():
+                for jf in pd.glob("*.jsonl"):
+                    try:
+                        mt = jf.stat().st_mtime
+                        if mt > latest_transcript_mtime:
+                            latest_transcript_mtime = mt
+                    except OSError:
+                        continue
+    transcripts_active = (now - latest_transcript_mtime) < 120 if latest_transcript_mtime else False
+    checks["transcripts_active"] = transcripts_active
+
+    # 3. Read last 50 stream samples
+    stream_samples = _read_last_samples(METRICS_STREAM, 50)
+    checks["stream_sample_count"] = len(stream_samples)
+    checks["stream_all_cache_1h_zero"] = all(s.get("cache_1h", 0) == 0 for s in stream_samples) if stream_samples else True
+    checks["stream_all_output_zero"] = all(s.get("output", 0) == 0 for s in stream_samples) if stream_samples else True
+
+    # 4. Read last 50 SSOT samples [red-team R2]
+    today = datetime.now().strftime("%Y-%m-%d")
+    ssot_file = METRICS_DATA_DIR / f"token-metrics-{today}.jsonl"
+    ssot_samples = _read_last_samples(ssot_file, 50) if ssot_file.exists() else []
+    checks["ssot_sample_count"] = len(ssot_samples)
+    checks["ssot_all_cache_1h_zero"] = all(s.get("cache_1h", 0) == 0 for s in ssot_samples) if ssot_samples else True
+    checks["ssot_all_output_zero"] = all(s.get("output", 0) == 0 for s in ssot_samples) if ssot_samples else True
+
+    # 5. Cross-validation on output_tokens, 15min window [red-team R3]
+    fifteen_min_ago = now - 900
+    stream_output = sum(s.get("output", 0) for s in stream_samples if s.get("ts", 0) > fifteen_min_ago)
+    ssot_output = sum(s.get("output", 0) for s in ssot_samples if s.get("ts", 0) > fifteen_min_ago)
+    if stream_output > 0 and ssot_output > 0:
+        divergence = abs(stream_output - ssot_output) / max(stream_output, ssot_output)
+    else:
+        divergence = 0
+    checks["cross_val_divergence"] = round(divergence, 3)
+
+    # 6. Schema version
+    checks["stream_schema_v"] = stream_samples[-1].get("v") if stream_samples else None
+
+    # 7. Skips [red-team P2-09: windowed]
+    skips_degraded = 0
+    if SKIPS_FILE.exists():
+        try:
+            sd = json.loads(SKIPS_FILE.read_text())
+            # Only count if recent (15 min window)
+            if now - sd.get("ts", 0) < 900:
+                skips_degraded = sd.get("degraded", 0)
+        except (json.JSONDecodeError, IOError):
+            pass
+    checks["skips_degraded"] = skips_degraded
+
+    # 8. Thinking
+    checks["all_thinking_zero"] = all(s.get("thinking_chars", 0) == 0 for s in stream_samples) if len(stream_samples) >= 20 else False
+
+    # Determine status (worst wins)
+    if not proxy_ok:
+        status = "proxy_down"
+    elif skips_degraded > 0:
+        status = "drops"
+    elif stream_age and stream_age > 120 and transcripts_active:
+        status = "stale"
+    elif stream_age and stream_age > 120 and not transcripts_active:
+        status = "idle"
+    # SSOT freshness [audit G2]
+    elif ssot_file.exists() and (now - ssot_file.stat().st_mtime) > 300 and transcripts_active:
+        status = "stale_ssot"
+    elif checks.get("stream_all_output_zero") and checks.get("ssot_all_output_zero") and len(stream_samples) >= 50:
+        status = "degraded_output"
+    elif checks.get("stream_all_cache_1h_zero") and len(stream_samples) >= 50:
+        status = "degraded_stream"
+    elif checks.get("ssot_all_cache_1h_zero") and len(ssot_samples) >= 50:
+        status = "degraded_ssot"
+    elif divergence > 0.15:
+        status = "drift"
+    elif checks.get("stream_schema_v") is not None and checks["stream_schema_v"] < 2:
+        status = "outdated"
+    elif checks.get("all_thinking_zero"):
+        status = "no_thinking"
+    else:
+        status = "ok"
+
+    checks["status"] = status
+    return checks
+
+
+def _read_last_samples(path: Path, n: int) -> list:
+    """Read last N valid JSON lines from a file."""
+    if not path or not path.exists():
+        return []
+    try:
+        lines = path.read_text().strip().split("\n")
+        samples = []
+        for line in lines[-n:]:
+            try:
+                samples.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return samples
+    except IOError:
+        return []
 
 
 def scan_task_counts() -> dict:
@@ -37,11 +272,8 @@ def scan_task_counts() -> dict:
     Returns {session_id: {turn_n: {"count": N, "agents": [{"desc": ..., "type": ...}]}}}
     for sessions present in the sidecar. Only scans sessions visible in the sidecar.
     """
-    if not SIDECAR_FILE.exists():
-        return {}
-    try:
-        sidecar = json.loads(SIDECAR_FILE.read_text())
-    except (json.JSONDecodeError, IOError):
+    sidecar = read_sidecar_jsonl()
+    if not sidecar:
         return {}
 
     # Build sessionId → transcript file mapping
@@ -159,14 +391,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(b"<h1>Dashboard not found</h1><p>Expected: " + str(DASHBOARD_FILE).encode() + b"</p>", 404)
 
         elif path == "/api/sidecar":
-            if SIDECAR_FILE.exists():
-                try:
-                    data = json.loads(SIDECAR_FILE.read_text())
-                    self.send_json(data)
-                except (json.JSONDecodeError, IOError) as e:
-                    self.send_json({"error": str(e)}, 500)
-            else:
-                self.send_json({})
+            data = read_sidecar_jsonl()
+            self.send_json(data)
 
         elif path == "/api/task-counts":
             now = time.time()
@@ -181,8 +407,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/stream":
             self._handle_sse()
 
+        elif path == "/api/metrics-health":
+            self.send_json(_check_metrics_health())
+
         elif path == "/api/health":
             self.send_json({"ok": True, "sidecar_exists": SIDECAR_FILE.exists(),
+                            "sidecar_jsonl_exists": SIDECAR_JSONL.exists(),
                             "metrics_stream_exists": METRICS_STREAM.exists()})
 
         else:
@@ -194,7 +424,6 @@ class Handler(BaseHTTPRequestHandler):
         Tails /tmp/token-metrics-stream.jsonl and pushes new lines as events.
         Uses raw socket sendall to bypass BufferedWriter buffering.
         """
-        import socket as _socket
         self.request.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
 
         # Send HTTP headers via raw socket to avoid wfile buffering
@@ -304,8 +533,9 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
+    warm_start_sidecar()
     print(f"Dashboard server running at http://localhost:{PORT}")
-    print(f"Sidecar: {SIDECAR_FILE}")
+    print(f"Sidecar JSONL: {SIDECAR_JSONL}")
     print(f"Dashboard: {DASHBOARD_FILE}")
     print("Press Ctrl+C to stop.")
     try:

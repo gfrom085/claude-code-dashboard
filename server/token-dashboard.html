@@ -121,20 +121,25 @@
 
   /* Speedometer gauge */
   .gauge-section {
-    display: flex; align-items: stretch; gap: 12px;
+    display: flex; align-items: center; gap: 24px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    padding: 16px;
+    padding: 20px 24px;
   }
-  .gauge-card { flex: 1; text-align: center; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 8px 8px; }
-  .gauge-card-wrap { position: relative; width: 180px; height: 110px; margin: 0 auto; }
-  .gauge-card-wrap canvas { width: 180px; height: 110px; }
-  .gauge-card-value {
-    position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
-    font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums;
+  .gauge-wrap { position: relative; width: 220px; height: 130px; flex-shrink: 0; }
+  .gauge-wrap canvas { width: 220px; height: 130px; }
+  .gauge-value {
+    position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums;
     color: var(--text); text-align: center; line-height: 1;
   }
-  .gauge-card-unit { font-size: 9px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
-  .gauge-card-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 6px; }
+  .gauge-unit { font-size: 11px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
+  .gauge-stats { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
+  .gauge-stat-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .gauge-stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .gauge-stat-value { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .gauge-stat-value.hot { color: #f97316; }
+  .gauge-stat-value.warm { color: var(--fork); }
+  .gauge-stat-value.cool { color: var(--green); }
 
   /* Project groups */
   .project-group { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 10px; }
@@ -200,35 +205,32 @@
 
 <main>
 
-  <!-- S0: 4 identical gauges -->
+  <!-- Health Banner -->
+  <div id="healthBanner" style="display:none; padding:10px 16px; font-size:13px; font-weight:600; border-radius:6px; margin-bottom:12px;"></div>
+
+  <!-- S0: Cache Throughput Gauge -->
   <div class="gauge-section">
-    <div class="gauge-card">
-      <div class="gauge-card-wrap">
-        <canvas id="gaugeCanvas" width="360" height="220"></canvas>
-        <div class="gauge-card-value" id="gaugeValue">0<span class="gauge-card-unit">M tok/min</span></div>
-      </div>
-      <div class="gauge-card-label">Cache Read</div>
+    <div class="gauge-wrap">
+      <canvas id="gaugeCanvas" width="440" height="260"></canvas>
+      <div class="gauge-value" id="gaugeValue">0<span class="gauge-unit">M tok/min</span></div>
     </div>
-    <div class="gauge-card">
-      <div class="gauge-card-wrap">
-        <canvas id="gauge5m" width="360" height="220"></canvas>
-        <div class="gauge-card-value" id="gaugeValue5m">0<span class="gauge-card-unit">M tok/min</span></div>
+    <div class="gauge-stats">
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Sessions actives</span>
+        <span class="gauge-stat-value" id="gaugeSessions">0</span>
       </div>
-      <div class="gauge-card-label">Write 5m</div>
-    </div>
-    <div class="gauge-card">
-      <div class="gauge-card-wrap">
-        <canvas id="gauge1h" width="360" height="220"></canvas>
-        <div class="gauge-card-value" id="gaugeValue1h">0<span class="gauge-card-unit">M tok/min</span></div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Cache read total</span>
+        <span class="gauge-stat-value" id="gaugeTotalRead">0</span>
       </div>
-      <div class="gauge-card-label">Write 1h</div>
-    </div>
-    <div class="gauge-card">
-      <div class="gauge-card-wrap">
-        <canvas id="gaugeOut" width="360" height="220"></canvas>
-        <div class="gauge-card-value" id="gaugeValueOut">0<span class="gauge-card-unit">M tok/min</span></div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Pic session</span>
+        <span class="gauge-stat-value hot" id="gaugePeakSession">—</span>
       </div>
-      <div class="gauge-card-label">Output</div>
+      <div class="gauge-stat-row">
+        <span class="gauge-stat-label">Coût read/min</span>
+        <span class="gauge-stat-value warm" id="gaugeCostMin">$0</span>
+      </div>
     </div>
   </div>
 
@@ -326,10 +328,7 @@ let sseSource = null;
 let sseActive = false;
 
 // ── Polyphonic pulse model — each API call = independent pulse ───────────────
-const pulses = [];             // [{rate, ts}, ...] — main gauge (cache_read)
-const pulses5m = [];           // cache write 5m
-const pulses1h = [];           // cache write 1h
-const pulsesOut = [];          // output tokens
+const pulses = [];             // [{rate, ts}, ...] — cache_read only
 const PULSE_RAMP_MS = 500;    // ramp-up τ — reaches ~95% in 1.5s (3τ)
 const PULSE_DECAY_HL = 4000;  // decay half-life 4s — pulse halves every 4s
 const PULSE_DECAY_K = Math.LN2 / PULSE_DECAY_HL;
@@ -345,107 +344,138 @@ let gaugeIntervalId = null;
 let GAUGE_MAX = 2;         // M tok/min — dynamic scale, starts at 2
 let _gaugeScaleDownCount = 0;
 
-// ── Unified gauge renderer — same look for all 4 ────────────────────────────
-const GAUGE_COLORS = {
-  read:  [{from:0,to:.25,c:'#22c55e'},{from:.25,to:.5,c:'#84cc16'},{from:.5,to:.7,c:'#eab308'},{from:.7,to:.85,c:'#f97316'},{from:.85,to:1,c:'#ef4444'}],
-  w5m:   [{from:0,to:.5,c:'#eab308'},{from:.5,to:.8,c:'#f97316'},{from:.8,to:1,c:'#ef4444'}],
-  w1h:   [{from:0,to:.5,c:'#f97316'},{from:.5,to:.8,c:'#ef4444'},{from:.8,to:1,c:'#dc2626'}],
-  out:   [{from:0,to:.5,c:'#8b5cf6'},{from:.5,to:.8,c:'#a78bfa'},{from:.8,to:1,c:'#c4b5fd'}],
-};
+// Cached gauge stats for display between polls
+let gaugeActiveSessions = 0;
+let gaugeTotalCacheRead = 0;
+let gaugePeakSid = '—';
+let gaugePeakSessionRate = 0;
 
-function drawGaugeOn(canvasId, rate, max, segs) {
-  const canvas = document.getElementById(canvasId);
+function drawGauge(rate) {
+  const canvas = document.getElementById('gaugeCanvas');
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
-  const cx = W / 2, cy = H - 12;
-  const R = Math.min(cx - 14, cy - 8);
-  ctx.clearRect(0, 0, W, H);
-  const SA = Math.PI;
+  const cx = W / 2, cy = H - 20;
+  const R = Math.min(cx - 20, cy - 10);
 
-  // Dim arcs
-  ctx.lineWidth = 12; ctx.lineCap = 'butt';
-  for (const s of segs) {
-    ctx.beginPath(); ctx.arc(cx, cy, R, SA + s.from * Math.PI, SA + s.to * Math.PI);
-    ctx.strokeStyle = s.c + '30'; ctx.stroke();
+  ctx.clearRect(0, 0, W, H);
+
+  const startAngle = Math.PI;
+
+  // Gradient segments: green → yellow → orange → red
+  const segments = [
+    { from: 0,    to: 0.25, color: '#22c55e' },
+    { from: 0.25, to: 0.50, color: '#84cc16' },
+    { from: 0.50, to: 0.70, color: '#eab308' },
+    { from: 0.70, to: 0.85, color: '#f97316' },
+    { from: 0.85, to: 1.00, color: '#ef4444' },
+  ];
+
+  // Draw dim arc background
+  ctx.lineWidth = 18;
+  ctx.lineCap = 'butt';
+  for (const seg of segments) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, startAngle + seg.from * Math.PI, startAngle + seg.to * Math.PI);
+    ctx.strokeStyle = seg.color + '40';
+    ctx.stroke();
   }
-  // Filled arc
-  const pct = Math.min(rate / max, 1);
-  const end = SA + pct * Math.PI;
-  ctx.lineWidth = 12; ctx.lineCap = 'round';
-  for (const s of segs) {
-    const a1 = SA + s.from * Math.PI, a2 = SA + s.to * Math.PI;
-    if (a1 >= end) break;
-    ctx.beginPath(); ctx.arc(cx, cy, R, a1, Math.min(a2, end));
-    ctx.strokeStyle = s.c; ctx.shadowColor = s.c; ctx.shadowBlur = 6;
-    ctx.stroke(); ctx.shadowBlur = 0;
+
+  // Draw filled arc up to current rate
+  const pct = Math.min(rate / GAUGE_MAX, 1);
+  const filledEnd = startAngle + pct * Math.PI;
+  ctx.lineWidth = 18;
+  ctx.lineCap = 'round';
+  for (const seg of segments) {
+    const a1 = startAngle + seg.from * Math.PI;
+    const a2 = startAngle + seg.to * Math.PI;
+    if (a1 >= filledEnd) break;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a1, Math.min(a2, filledEnd));
+    ctx.strokeStyle = seg.color;
+    ctx.shadowColor = seg.color;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
   }
-  // Glow tip
+
+  // Glow pulse on the arc tip when rate > 0
   if (pct > 0.01) {
-    const tx = cx + Math.cos(end) * R, ty = cy + Math.sin(end) * R;
-    const ts = segs.find(s => pct <= s.to) || segs[segs.length - 1];
-    const g = ctx.createRadialGradient(tx, ty, 0, tx, ty, 10);
-    g.addColorStop(0, ts.c + '80'); g.addColorStop(1, ts.c + '00');
-    ctx.beginPath(); ctx.arc(tx, ty, 10, 0, 2 * Math.PI); ctx.fillStyle = g; ctx.fill();
+    const tipX = cx + Math.cos(filledEnd) * R;
+    const tipY = cy + Math.sin(filledEnd) * R;
+    const tipSeg = segments.find(s => pct <= s.to) || segments[segments.length - 1];
+    const glow = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, 14);
+    glow.addColorStop(0, tipSeg.color + '80');
+    glow.addColorStop(1, tipSeg.color + '00');
+    ctx.beginPath();
+    ctx.arc(tipX, tipY, 14, 0, 2 * Math.PI);
+    ctx.fillStyle = glow;
+    ctx.fill();
   }
+
   // Needle
-  const na = SA + pct * Math.PI, nl = R - 16;
-  ctx.beginPath(); ctx.moveTo(cx, cy);
-  ctx.lineTo(cx + Math.cos(na) * nl, cy + Math.sin(na) * nl);
-  ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2; ctx.lineCap = 'round';
-  ctx.shadowColor = '#e2e8f0'; ctx.shadowBlur = 4; ctx.stroke(); ctx.shadowBlur = 0;
+  const needleAngle = startAngle + pct * Math.PI;
+  const needleLen = R - 25;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(needleAngle) * needleLen, cy + Math.sin(needleAngle) * needleLen);
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.shadowColor = '#e2e8f0';
+  ctx.shadowBlur = 6;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
   // Center dot
-  ctx.beginPath(); ctx.arc(cx, cy, 3.5, 0, 2 * Math.PI); ctx.fillStyle = '#e2e8f0'; ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fill();
+
   // Scale labels
-  ctx.font = '9px Inter, system-ui, sans-serif'; ctx.fillStyle = '#64748b'; ctx.textAlign = 'center';
-  for (const f of [0, 0.25, 0.5, 0.75, 1]) {
-    const v = (f * max).toFixed(max < 1 ? 2 : max < 10 ? 1 : 0);
-    const a = SA + f * Math.PI;
-    ctx.fillText(v, cx + Math.cos(a) * (R + 12), cy + Math.sin(a) * (R + 12) + 3);
+  ctx.font = '11px Inter, system-ui, sans-serif';
+  ctx.fillStyle = '#64748b';
+  ctx.textAlign = 'center';
+  // Dynamic labels based on current GAUGE_MAX
+  const steps = [0, 0.1, 0.25, 0.5, 0.75, 1].map(f => Math.round(f * GAUGE_MAX));
+  for (const v of steps) {
+    const a = startAngle + (v / GAUGE_MAX) * Math.PI;
+    ctx.fillText(v + '', cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16) + 4);
   }
 }
 
 // ── Gauge animation — polyphonic: sum of independent pulses ─────────────────
-const GAUGE_TICK_MS = 50;
-
-function sumPulses(arr, now) {
-  let total = 0;
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const p = arr[i], age = now - p.ts;
-    const val = p.rate * (1 - Math.exp(-age / PULSE_RAMP_MS)) * Math.exp(-PULSE_DECAY_K * age);
-    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) { arr.splice(i, 1); }
-    else { total += val; }
-  }
-  return total;
-}
-
-// Per-gauge auto-scaling max
-const gMax = { read: 2, w5m: 0.5, w1h: 0.5, out: 0.5 };
-
-function autoScale(key, rate) {
-  if (rate > gMax[key] * 0.7) gMax[key] = Math.max(gMax[key], Math.ceil(rate * 3));
-  return gMax[key];
-}
-
-function fmtRate(r) { return r > 0.005 ? r.toFixed(r < 0.1 ? 2 : 1) : '0'; }
+const GAUGE_TICK_MS = 50;  // 20fps
 
 function gaugeTick() {
   const now = performance.now();
-  const rRead = sumPulses(pulses, now);
-  const r5m   = sumPulses(pulses5m, now);
-  const r1h   = sumPulses(pulses1h, now);
-  const rOut  = sumPulses(pulsesOut, now);
-  displayRate = rRead < 0.01 ? 0 : rRead;
 
-  drawGaugeOn('gaugeCanvas', rRead, autoScale('read', rRead), GAUGE_COLORS.read);
-  drawGaugeOn('gauge5m',     r5m,   autoScale('w5m', r5m),    GAUGE_COLORS.w5m);
-  drawGaugeOn('gauge1h',     r1h,   autoScale('w1h', r1h),    GAUGE_COLORS.w1h);
-  drawGaugeOn('gaugeOut',    rOut,   autoScale('out', rOut),   GAUGE_COLORS.out);
+  // Sum all active pulses: each has its own ramp × decay envelope
+  let totalRate = 0;
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    const age = now - p.ts;
+    const ramp = 1 - Math.exp(-age / PULSE_RAMP_MS);       // rises to ~95% in 4.5s
+    const decay = Math.exp(-PULSE_DECAY_K * age);           // halves every 8s
+    const val = p.rate * ramp * decay;
+    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) {
+      pulses.splice(i, 1);  // dead pulse, remove
+    } else {
+      totalRate += val;
+    }
+  }
 
-  document.getElementById('gaugeValue').innerHTML    = `${fmtRate(rRead)}<span class="gauge-card-unit">M tok/min</span>`;
-  document.getElementById('gaugeValue5m').innerHTML  = `${fmtRate(r5m)}<span class="gauge-card-unit">M tok/min</span>`;
-  document.getElementById('gaugeValue1h').innerHTML  = `${fmtRate(r1h)}<span class="gauge-card-unit">M tok/min</span>`;
-  document.getElementById('gaugeValueOut').innerHTML = `${fmtRate(rOut)}<span class="gauge-card-unit">M tok/min</span>`;
+  displayRate = totalRate;
+  if (displayRate < 0.01) displayRate = 0;
+
+  drawGauge(displayRate);
+
+  document.getElementById('gaugeValue').innerHTML =
+    `${displayRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
+  const costMin = displayRate * 0.30;
+  document.getElementById('gaugeCostMin').textContent =
+    costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
 }
 
 function startGaugeAnim() {
@@ -464,15 +494,8 @@ function initSSE() {
       sseActive = true;
       try {
         const d = JSON.parse(e.data);
-        const now = performance.now();
-        const cr = (d.cache_read || 0) / 1e6;
-        const c5 = (d.cache_5m || 0) / 1e6;
-        const c1 = (d.cache_1h || 0) / 1e6;
-        const ot = (d.output || 0) / 1e6;
-        if (cr > 0) pulses.push({ rate: cr, ts: now });
-        if (c5 > 0) pulses5m.push({ rate: c5, ts: now });
-        if (c1 > 0) pulses1h.push({ rate: c1, ts: now });
-        if (ot > 0) pulsesOut.push({ rate: ot, ts: now });
+        const rate = (d.cache_read || 0) / 1e6;
+        if (rate > 0) pulses.push({ rate, ts: performance.now() });
       } catch (_) { /* ignore malformed */ }
     });
     sseSource.onerror = () => {
@@ -525,6 +548,29 @@ function updateGauge() {
   } else {
     _gaugeScaleDownCount = 0;
   }
+
+  // Update static stats (not animated)
+  gaugeActiveSessions = active.length;
+  gaugeTotalCacheRead = totalCacheRead;
+  document.getElementById('gaugeSessions').textContent = active.length;
+  document.getElementById('gaugeTotalRead').textContent = fmtTokens(totalCacheRead);
+
+  // Peak per-session rate
+  let peakSid = '—', peakSessionRate = 0;
+  for (const [sid, s] of active) {
+    const turns = [...(s.turns || [])].sort((a, b) => (a.ts||0) - (b.ts||0));
+    if (turns.length < 2) continue;
+    const last = turns[turns.length - 1];
+    const prev = turns[turns.length - 2];
+    if (last.ts && prev.ts && last.ts > prev.ts) {
+      const dt = (last.ts - prev.ts) / 60;
+      if (dt < 0.001) continue;
+      const r = (last.cache_read || 0) / dt / 1e6;
+      if (r > peakSessionRate) { peakSessionRate = r; peakSid = sid.substring(0, 8); }
+    }
+  }
+  document.getElementById('gaugePeakSession').textContent =
+    peakSessionRate > 0 ? `${peakSessionRate.toFixed(1)}M/min (${peakSid})` : '—';
 
   startGaugeAnim();
 }
@@ -1104,6 +1150,41 @@ async function runCacheAudit() {
     pre.textContent = 'Error: ' + e.message;
   }
 }
+
+// ── Health Banner ────────────────────────────────────────────────────────────
+const HEALTH_MESSAGES = {
+    proxy_down: { bg: '#dc2626', msg: '\u26A0 mitmproxy unreachable on :8082 — gauges dead' },
+    drops: { bg: '#dc2626', msg: '\u26A0 Degraded skips (429/timeouts) — check API quotas' },
+    stale: { bg: '#f97316', msg: '\u26A0 No data since >2min — is mitmproxy running?' },
+    stale_ssot: { bg: '#f97316', msg: '\u26A0 SSOT stale >5min — check langfuse hook' },
+    degraded_stream: { bg: '#f97316', msg: '\u26A0 Stream: cache_1h always 0 — check metrics_addon.py' },
+    degraded_ssot: { bg: '#f97316', msg: '\u26A0 SSOT: cache_1h always 0 — check transcript format' },
+    degraded_output: { bg: '#f97316', msg: '\u26A0 output_tokens always 0 — API schema may have changed' },
+    drift: { bg: '#f97316', msg: '\u26A0 Stream vs SSOT output_tokens diverge >15%' },
+    outdated: { bg: '#eab308', msg: '\u26A0 Schema v1 detected — restart mitmproxy after update' },
+    no_thinking: { bg: '#eab308', msg: '\u26A0 No thinking blocks captured — check addon.py' },
+};
+
+function pollHealth() {
+    fetch('/api/metrics-health')
+        .then(r => r.json())
+        .then(d => {
+            const banner = document.getElementById('healthBanner');
+            const info = HEALTH_MESSAGES[d.status];
+            if (info) {
+                banner.style.display = 'block';
+                banner.style.background = info.bg;
+                banner.style.color = '#fff';
+                banner.textContent = info.msg;
+            } else {
+                banner.style.display = 'none';
+            }
+        })
+        .catch(() => {});
+}
+
+setInterval(pollHealth, 60000);
+pollHealth();  // initial check
 </script>
 <div id="turn-tooltip"></div>
 </body>

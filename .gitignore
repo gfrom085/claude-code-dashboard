@@ -2,6 +2,7 @@
 *.log
 langfuse_state.json
 langfuse-token-metrics.json
+data/*.jsonl
 
 # Python
 __pycache__/

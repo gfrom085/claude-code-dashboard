@@ -9,13 +9,11 @@ Resilience: If Langfuse is unavailable, traces are queued locally and
 automatically drained on the next successful connection.
 """
 
-import fcntl
 import itertools
 import json
 import os
 import sys
 import time
-import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +31,13 @@ LOG_FILE = Path.home() / ".claude" / "state" / "langfuse_hook.log"
 STATE_FILE = Path.home() / ".claude" / "state" / "langfuse_state.json"
 QUEUE_FILE = Path.home() / ".claude" / "state" / "pending_traces.jsonl"
 SIDECAR_FILE = Path("/tmp/langfuse-token-metrics.json")
+SIDECAR_JSONL = Path("/tmp/langfuse-token-metrics.jsonl")
+# SSOT JSONL daté — persistant sur disque (pas /tmp qui est tmpfs volatile)
+# Hardcoded to avoid symlink resolution issues [red-team P2-S04]
+METRICS_DATA_DIR = Path(os.environ.get(
+    "CC_DASHBOARD_DATA_DIR",
+    str(Path.home() / "active-projects" / "claude-code-dashboard" / "data")
+))
 DEBUG = os.environ.get("CC_LANGFUSE_DEBUG", "").lower() == "true"
 HEALTH_CHECK_TIMEOUT = 2  # seconds
 
@@ -55,6 +60,58 @@ PRICES_PER_TOKEN = {
 # Default fallback (Sonnet pricing)
 DEFAULT_MODEL = "claude-sonnet-4-6"
 TEAM_WINDOW_SECONDS = 300  # seconds gap for concurrent agent detection
+
+
+def write_dated_jsonl(sample: dict) -> None:
+    """Append a sample to the daily JSONL file. Atomic os.write()."""
+    METRICS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    path = METRICS_DATA_DIR / f"token-metrics-{date_str}.jsonl"
+    line = (json.dumps(sample, separators=(",", ":")) + "\n").encode()
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def append_sidecar(session_id, session_type, project_name, turn_num, usage, ts, model=None):
+    """Append a sidecar line. No lock needed — atomic os.write()."""
+    model_key = model or DEFAULT_MODEL
+    if model_key not in PRICES_PER_TOKEN:
+        model_key = DEFAULT_MODEL
+    prices = PRICES_PER_TOKEN[model_key]
+
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_creation = usage.get("cache_creation_input_tokens", 0)
+    cache_5m = usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
+    cache_1h = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
+
+    savings = cache_read * (prices["input"] - prices["cache_read"])
+    surcharge_5m = cache_5m * (prices["cache_write_5m"] - prices["input"])
+    surcharge_1h = cache_1h * (prices["cache_write_1h"] - prices["input"])
+
+    line = json.dumps({
+        "sid": session_id,
+        "type": session_type,
+        "project": project_name,
+        "turn": turn_num,
+        "ts": ts,
+        "input": usage.get("input_tokens", 0),
+        "output": usage.get("output_tokens", 0),
+        "cache_read": cache_read,
+        "cache_creation": cache_creation,
+        "cache_5m": cache_5m,
+        "cache_1h": cache_1h,
+        "cache_savings_usd": round(savings, 6),
+        "cache_surcharge_usd": round(surcharge_5m + surcharge_1h, 6),
+    }, separators=(",", ":")) + "\n"
+
+    fd = os.open(str(SIDECAR_JSONL), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
 
 
 def log(level: str, message: str) -> None:
@@ -381,204 +438,6 @@ def detect_session_type(transcript_file: Path, session_id: str, file_mtime: floa
     return ("main", None)
 
 
-def load_sidecar() -> dict:
-    """Load the sidecar JSON file (token metrics per session).
-
-    NOTE: Caller must hold SIDECAR_LOCK exclusively for the full
-    read-modify-write cycle. See acquire_sidecar_lock().
-    """
-    if not SIDECAR_FILE.exists():
-        return {}
-    try:
-        return json.loads(SIDECAR_FILE.read_text())
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-
-def acquire_sidecar_lock():
-    """Acquire exclusive lock for the full sidecar read-modify-write cycle.
-
-    Uses non-blocking lock with 3 retry attempts. If lock cannot be acquired,
-    returns None and caller should skip the operation.
-
-    Usage:
-        lock_fd = acquire_sidecar_lock()
-        try:
-            if lock_fd:
-                sidecar = load_sidecar()
-                # ... modify sidecar ...
-                save_sidecar(sidecar)
-        finally:
-            if lock_fd:
-                release_sidecar_lock(lock_fd)
-    """
-    SIDECAR_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    lf = open(SIDECAR_LOCK, "w")
-    for _attempt in range(3):
-        try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return lf
-        except BlockingIOError:
-            if _attempt == 2:
-                debug("Lock acquisition failed after 3 attempts, skipping")
-                lf.close()
-                return None
-            _time.sleep(0.1)
-    return None
-
-
-def release_sidecar_lock(lf):
-    """Release the sidecar lock. Handles None gracefully if lock was not acquired."""
-    if lf is None:
-        return
-    try:
-        fcntl.flock(lf, fcntl.LOCK_UN)
-        lf.close()
-    except Exception:
-        pass  # Already closed or other error
-
-
-def reconcile_sidecar(sidecar: dict) -> int:
-    """Correct stale last_seen timestamps using file_mtime as ground truth.
-
-    After a state reset or pre-patch run, old sessions may have last_seen = time.time()
-    (phantom "active now" timestamp). This function fixes every entry so that
-    last_seen = file_mtime (when Claude Code last actually wrote to the transcript).
-
-    Returns the number of entries corrected.
-    """
-    projects_dir = Path.home() / ".claude" / "projects"
-    file_mtimes: dict[str, float] = {}
-
-    if projects_dir.exists():
-        for project_dir in projects_dir.iterdir():
-            if not project_dir.is_dir():
-                continue
-            for transcript_file in itertools.chain(project_dir.glob("*.jsonl"), project_dir.glob("*/subagents/agent-*.jsonl")):
-                try:
-                    with open(transcript_file) as f:
-                        first_line = f.readline()
-                    first_msg = json.loads(first_line)
-                    raw_sid = first_msg.get("sessionId", transcript_file.stem)
-                    is_sub = "/subagents/" in str(transcript_file)
-                    sid = f"{raw_sid}::{transcript_file.stem}" if is_sub else raw_sid
-                    if sid in sidecar:
-                        # Keep the LARGEST mtime in case of resumed sessions
-                        # (multiple .jsonl files sharing the same sessionId)
-                        mtime = transcript_file.stat().st_mtime
-                        if mtime > file_mtimes.get(sid, 0):
-                            file_mtimes[sid] = mtime
-                except (json.JSONDecodeError, IOError, IndexError):
-                    continue
-
-    corrected = 0
-    for sid, entry in sidecar.items():
-        if not isinstance(entry, dict) or not entry.get("turns"):
-            continue
-        true_last_seen = file_mtimes.get(sid)
-        if true_last_seen is None:
-            continue  # file deleted — leave as-is, will age out naturally
-        if abs(entry.get("last_seen", 0) - true_last_seen) > 1:
-            entry["last_seen"] = true_last_seen
-            # Also fix individual turn timestamps that got time.time() instead of file_mtime
-            for t in entry["turns"]:
-                if t.get("ts", 0) > true_last_seen + 1:
-                    t["ts"] = true_last_seen
-            corrected += 1
-
-    return corrected
-
-
-SIDECAR_LOCK = SIDECAR_FILE.with_suffix(".lock")
-
-
-def save_sidecar(data: dict) -> None:
-    """Write the sidecar JSON atomically.
-
-    NOTE: Caller must hold SIDECAR_LOCK exclusively. See acquire_sidecar_lock().
-    """
-    tmp = SIDECAR_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, separators=(",", ":")))
-    tmp.replace(SIDECAR_FILE)
-
-
-def update_sidecar(
-    sidecar: dict,
-    session_id: str,
-    session_type: str,
-    parent_session: str | None,
-    project_name: str,
-    turn_n: int,
-    usage: dict,
-    ts: float,
-    model: str | None = None,
-) -> None:
-    """Update sidecar dict in-place with token metrics for a turn.
-
-    Calculates cache cost delta:
-    - cache_savings_usd: money saved by reading from cache vs paying full input price
-    - cache_surcharge_usd: extra cost of cache creation vs base input price
-    """
-    # Get model-specific pricing (default to Sonnet)
-    model_key = model or DEFAULT_MODEL
-    if model_key not in PRICES_PER_TOKEN:
-        model_key = DEFAULT_MODEL
-    prices = PRICES_PER_TOKEN[model_key]
-
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_creation = usage.get("cache_creation_input_tokens", 0)
-    cache_5m = usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
-    cache_1h = usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
-
-    savings = cache_read * (prices["input"] - prices["cache_read"])
-    surcharge_5m = cache_5m * (prices["cache_write_5m"] - prices["input"])
-    surcharge_1h = cache_1h * (prices["cache_write_1h"] - prices["input"])
-    surcharge = surcharge_5m + surcharge_1h
-
-    # Fork cache reuse: at turn 1, compute ratio cache_read / parent total cache
-    fork_cache_reuse = None
-    if session_type == "fork" and turn_n == 1 and parent_session and parent_session in sidecar:
-        parent_turns = sidecar[parent_session].get("turns", [])
-        parent_total_creation = sum(t.get("cache_creation", 0) for t in parent_turns)
-        if parent_total_creation > 0:
-            fork_cache_reuse = round(cache_read / parent_total_creation, 4)
-
-    turn_entry = {
-        "n": turn_n,
-        "ts": ts,
-        "input": usage.get("input_tokens", 0),
-        "output": usage.get("output_tokens", 0),
-        "cache_read": cache_read,
-        "cache_creation": cache_creation,
-        "cache_5m": cache_5m,
-        "cache_1h": cache_1h,
-        "cache_savings_usd": round(savings, 6),
-        "cache_surcharge_usd": round(surcharge, 6),
-        "fork_cache_reuse": fork_cache_reuse,
-    }
-
-    if session_id not in sidecar:
-        sidecar[session_id] = {
-            "type": session_type,
-            "project": project_name,
-            "parent_session": parent_session,
-            "turns": [],
-            "last_seen": ts,
-        }
-
-    session_entry = sidecar[session_id]
-    # Replace turn if already exists (idempotent), else append
-    turns = session_entry["turns"]
-    for i, t in enumerate(turns):
-        if t["n"] == turn_n:
-            turns[i] = turn_entry
-            break
-    else:
-        turns.append(turn_entry)
-
-    session_entry["last_seen"] = ts
-
-
 def extract_project_name(project_dir: Path) -> str:
     """Extract a human-readable project name from the Claude projects directory name.
 
@@ -646,7 +505,7 @@ def find_latest_transcript() -> tuple[str, Path, str] | None:
     return None
 
 
-def find_modified_transcripts(state: dict, max_sessions: int = 10) -> list[tuple[str, Path, str]]:
+def find_modified_transcripts(state: dict, max_sessions: int = 200) -> list[tuple[str, Path, str]]:
     """Find all transcripts that have been modified since their last state update.
 
     Returns up to max_sessions transcripts, sorted by modification time (most recent first).
@@ -980,13 +839,23 @@ def process_transcript(
     transcript_file: Path,
     state: dict,
     project_name: str = "",
-    sidecar: dict | None = None,
 ) -> int:
     """Process a transcript file and create traces for new turns."""
     # Get previous state for this session
     session_state = state.get(session_id, {})
     last_line = session_state.get("last_line", 0)
     turn_count = session_state.get("turn_count", 0)
+
+    # Store first_seen at first processing [red-team P2-01]
+    if session_id not in state:
+        try:
+            with open(transcript_file) as f:
+                first_line_data = json.loads(f.readline())
+            first_ts = first_line_data.get("timestamp", "")
+            first_seen = first_ts[:10] if first_ts else datetime.now().strftime("%Y-%m-%d")
+        except (json.JSONDecodeError, IOError):
+            first_seen = datetime.now().strftime("%Y-%m-%d")
+        state[session_id] = {"first_seen": first_seen}
 
     # Read only new lines from transcript (skip already-processed lines)
     # Avoids loading multi-MB files into memory on every hook invocation
@@ -1065,12 +934,47 @@ def process_transcript(
                     current_assistants, current_tool_results, project_name,
                     usage=current_turn_usage, session_type=session_type,
                 )
-                if sidecar is not None and current_turn_usage is not None:
-                    update_sidecar(
-                        sidecar, session_id, session_type, parent_session,
-                        project_name, turn_num, current_turn_usage, file_mtime,
-                        model=msg_model,
-                    )
+                if current_turn_usage is not None:
+                    try:
+                        append_sidecar(
+                            session_id, session_type, project_name,
+                            turn_num, current_turn_usage, file_mtime,
+                            model=msg_model,
+                        )
+                    except OSError as e:
+                        debug(f"Failed to append sidecar: {e}")
+                    # Write SSOT JSONL daté [design: Composant 2, C1]
+                    _m_key = msg_model if msg_model in PRICES_PER_TOKEN else DEFAULT_MODEL
+                    _prices = PRICES_PER_TOKEN[_m_key]
+                    _cr = current_turn_usage.get("cache_read_input_tokens", 0)
+                    _c5m = current_turn_usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
+                    _c1h = current_turn_usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
+                    dated_sample = {
+                        "v": 2,
+                        "ts": file_mtime,
+                        "session_id": session_id,
+                        "session_type": session_type,
+                        "session_start_date": state.get(session_id, {}).get(
+                            "first_seen", datetime.now().strftime("%Y-%m-%d")),
+                        "project": project_name,
+                        "turn": turn_num,
+                        "model": msg_model,
+                        "input": current_turn_usage.get("input_tokens", 0),
+                        "output": current_turn_usage.get("output_tokens", 0),
+                        "cache_read": _cr,
+                        "cache_creation": current_turn_usage.get("cache_creation_input_tokens", 0),
+                        "cache_5m": _c5m,
+                        "cache_1h": _c1h,
+                        "cache_savings_usd": round(_cr * (_prices["input"] - _prices["cache_read"]), 6),
+                        "cache_surcharge_usd": round(
+                            _c5m * (_prices["cache_write_5m"] - _prices["input"])
+                            + _c1h * (_prices["cache_write_1h"] - _prices["input"]), 6),
+                        "service_tier": current_turn_usage.get("service_tier", "unknown"),
+                    }
+                    try:
+                        write_dated_jsonl(dated_sample)
+                    except OSError as e:
+                        debug(f"Failed to write dated JSONL: {e}")
 
             # Start new turn
             current_user = msg
@@ -1117,19 +1021,54 @@ def process_transcript(
             current_assistants, current_tool_results, project_name,
             usage=current_turn_usage, session_type=session_type,
         )
-        if sidecar is not None and current_turn_usage is not None:
+        if current_turn_usage is not None:
             # Use file_mtime (not time.time()) so that re-processed historical
             # sessions don't get a phantom "active now" timestamp on their last turn.
-            # For the live session, file_mtime ≈ time.time() since the transcript
-            # was just written by Claude Code.
-            update_sidecar(
-                sidecar, session_id, session_type, parent_session,
-                project_name, turn_num, current_turn_usage, file_mtime,
-                model=msg_model,
-            )
+            try:
+                append_sidecar(
+                    session_id, session_type, project_name,
+                    turn_num, current_turn_usage, file_mtime,
+                    model=msg_model,
+                )
+            except OSError as e:
+                debug(f"Failed to append sidecar: {e}")
+            # Write SSOT JSONL daté [design: Composant 2, C1]
+            _m_key = msg_model if msg_model in PRICES_PER_TOKEN else DEFAULT_MODEL
+            _prices = PRICES_PER_TOKEN[_m_key]
+            _cr = current_turn_usage.get("cache_read_input_tokens", 0)
+            _c5m = current_turn_usage.get("cache_creation", {}).get("ephemeral_5m_input_tokens", 0)
+            _c1h = current_turn_usage.get("cache_creation", {}).get("ephemeral_1h_input_tokens", 0)
+            dated_sample = {
+                "v": 2,
+                "ts": file_mtime,
+                "session_id": session_id,
+                "session_type": session_type,
+                "session_start_date": state.get(session_id, {}).get(
+                    "first_seen", datetime.now().strftime("%Y-%m-%d")),
+                "project": project_name,
+                "turn": turn_num,
+                "model": msg_model,
+                "input": current_turn_usage.get("input_tokens", 0),
+                "output": current_turn_usage.get("output_tokens", 0),
+                "cache_read": _cr,
+                "cache_creation": current_turn_usage.get("cache_creation_input_tokens", 0),
+                "cache_5m": _c5m,
+                "cache_1h": _c1h,
+                "cache_savings_usd": round(_cr * (_prices["input"] - _prices["cache_read"]), 6),
+                "cache_surcharge_usd": round(
+                    _c5m * (_prices["cache_write_5m"] - _prices["input"])
+                    + _c1h * (_prices["cache_write_1h"] - _prices["input"]), 6),
+                "service_tier": current_turn_usage.get("service_tier", "unknown"),
+            }
+            try:
+                write_dated_jsonl(dated_sample)
+            except OSError as e:
+                debug(f"Failed to write dated JSONL: {e}")
 
-    # Update state
+    # Update state — preserve first_seen across updates
+    first_seen = state.get(session_id, {}).get("first_seen", datetime.now().strftime("%Y-%m-%d"))
     state[session_id] = {
+        "first_seen": first_seen,
         "last_line": total_lines,
         "turn_count": turn_count + turns,
         "updated": datetime.now(timezone.utc).isoformat(),
@@ -1171,7 +1110,7 @@ def main():
     state = load_state()
 
     # Find all modified transcripts (up to 10 most recent)
-    modified_transcripts = find_modified_transcripts(state, max_sessions=10)
+    modified_transcripts = find_modified_transcripts(state, max_sessions=200)
 
     if not modified_transcripts:
         debug("No modified transcripts found")
@@ -1179,17 +1118,19 @@ def main():
 
     debug(f"Found {len(modified_transcripts)} modified session(s) to process")
 
-    # Always acquire sidecar lock and update sidecar, regardless of Langfuse availability
-    sidecar_lock = acquire_sidecar_lock()
+    # Auto-migrate old sidecar format [red-team P2-07]
+    old_sidecar = Path("/tmp/langfuse-token-metrics.json")
+    if old_sidecar.exists() and not SIDECAR_JSONL.exists():
+        try:
+            import subprocess
+            subprocess.run([sys.executable,
+                str(Path(__file__).parent.parent / "scripts" / "migrate_sidecar.py")],
+                timeout=10)
+        except Exception as e:
+            debug(f"Sidecar migration failed: {e}")
+
     langfuse = None
     try:
-        # If lock couldn't be acquired, skip processing
-        if sidecar_lock is None:
-            log("WARN", "Could not acquire sidecar lock after 3 attempts, skipping sidecar update")
-            sys.exit(0)
-
-        sidecar = load_sidecar()
-
         # Check if Langfuse is reachable
         langfuse_available = check_langfuse_health(host)
 
@@ -1239,14 +1180,6 @@ def main():
 
             save_state(state)
 
-            # Update sidecar even when Langfuse is down
-            if sidecar:
-                try:
-                    save_sidecar(sidecar)
-                    debug(f"Sidecar written: {len(sidecar)} sessions")
-                except Exception as e:
-                    log("ERROR", f"Failed to write sidecar: {e}")
-
             duration = (datetime.now() - script_start).total_seconds()
             log("INFO", f"Queued {total_turns_queued} turns from {len(modified_transcripts)} sessions in {duration:.1f}s")
             return
@@ -1260,12 +1193,6 @@ def main():
             )
         except Exception as e:
             log("ERROR", f"Failed to initialize Langfuse client: {e}")
-            # Write sidecar before exit
-            if sidecar:
-                try:
-                    save_sidecar(sidecar)
-                except Exception as se:
-                    log("ERROR", f"Failed to write sidecar: {se}")
             return
 
         # First, drain any queued traces
@@ -1279,7 +1206,7 @@ def main():
             try:
                 turns = process_transcript(
                     langfuse, session_id, transcript_file, state,
-                    project_name, sidecar=sidecar,
+                    project_name,
                 )
                 total_turns += turns
                 debug(f"Processed {turns} turns from session {session_id}")
@@ -1291,21 +1218,6 @@ def main():
 
         # Flush to ensure all data is sent
         langfuse.flush()
-
-        # Reconcile stale last_seen timestamps before writing.
-        # Corrects phantom time.time() values from pre-patch runs or state resets.
-        if sidecar:
-            reconciled = reconcile_sidecar(sidecar)
-            if reconciled > 0:
-                log("INFO", f"Reconciled {reconciled} stale sidecar entries")
-
-        # Write sidecar after all sessions processed
-        if sidecar:
-            try:
-                save_sidecar(sidecar)
-                debug(f"Sidecar written: {len(sidecar)} sessions")
-            except Exception as e:
-                log("ERROR", f"Failed to write sidecar: {e}")
 
         # Log execution time
         duration = (datetime.now() - script_start).total_seconds()
@@ -1319,7 +1231,6 @@ def main():
         import traceback
         debug(traceback.format_exc())
     finally:
-        release_sidecar_lock(sidecar_lock)
         if langfuse:
             langfuse.shutdown()
 
