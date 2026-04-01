@@ -1337,9 +1337,9 @@ function _handleMetricsEvent(e, isCatchup) {
       const d = JSON.parse(e.data);
       const sampleTs = d.ts ? d.ts * 1000 : Date.now();  // ts is epoch seconds
 
-      // On first catchup event, recalibrate histogram to stream start time
-      if (isCatchup && _acc.calls === 0 && d.ts) {
-        _histSessionStart = sampleTs;
+      // On first catchup event, recalibrate histogram to cover last 5h
+      if (isCatchup && _acc.calls === 0) {
+        _histSessionStart = Date.now() - HIST_MAX_BUCKETS * HIST_BUCKET_MS;
         for (let i = 0; i < _histBuckets.length; i++) {
           _histBuckets[i].t = _histSessionStart + i * HIST_BUCKET_MS;
           _histBuckets[i].cache_read = 0; _histBuckets[i].cache_5m = 0;
