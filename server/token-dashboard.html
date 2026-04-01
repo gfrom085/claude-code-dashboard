@@ -1371,14 +1371,21 @@ function _handleMetricsEvent(e, isCatchup) {
       const d = JSON.parse(e.data);
       const sampleTs = d.ts ? d.ts * 1000 : Date.now();  // ts is epoch seconds
 
+      // Early-return for session-boundary events — BEFORE _acc.calls++ and _getModelPricing [RT-F11/v2-F3]
+      if (d.source === 'session-boundary') {
+        _handleSessionBoundary(d, isCatchup);
+        return;
+      }
+
+      // Early-return for claude-ai-usage events (skip catchup to avoid stale data)
+      if (d.source === 'claude-ai-usage') {
+        if (!isCatchup) _updateClaudeUsagePanel(d);
+        return;
+      }
+
       // On first catchup event, recalibrate histogram to cover last 5h
       if (isCatchup && _acc.calls === 0) {
-        _histSessionStart = Date.now() - HIST_MAX_BUCKETS * HIST_BUCKET_MS;
-        for (let i = 0; i < _histBuckets.length; i++) {
-          _histBuckets[i].t = _histSessionStart + i * HIST_BUCKET_MS;
-          _histBuckets[i].cache_read = 0; _histBuckets[i].cache_5m = 0;
-          _histBuckets[i].cache_1h = 0; _histBuckets[i].output = 0; _histBuckets[i].input = 0;
-        }
+        _resetHistogram(Date.now() - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
       }
 
       const p = _getModelPricing(d.model);
@@ -1476,12 +1483,6 @@ function _handleMetricsEvent(e, isCatchup) {
       document.getElementById('totalCostCalls').textContent = _acc.calls.toLocaleString();
       document.getElementById('totalCostTokens').textContent = _fmtTokens(totalTokens);
 
-      // Claude.ai Usage panel — filter by source (skip catchup to avoid stale data)
-      if (d.source === 'claude-ai-usage') {
-        if (!isCatchup) _updateClaudeUsagePanel(d);
-        return;  // not a token event, skip gauge processing
-      }
-
       // SDK Sidequest gauge — filter by source
       const isSdk = (d.source || '').startsWith('sdk-');
       if (isSdk) {
@@ -1507,6 +1508,101 @@ function _handleMetricsEvent(e, isCatchup) {
 
     } catch (_) { /* ignore malformed */ }
 }
+// ── Session Boundary + Histogram Reset Logic ────────────────────────────────
+let _lastBoundaryId = null;       // dedup boundary events [RT-v2-F4]
+let _claudeResetsAt = null;       // closure, not window.* [RT-v2-F9]
+let _pendingBoundaryFlash = false;
+
+function _resetHistogram(newStartMs) {
+  // Atomically destroy Chart.js instance + clear buckets + reallocate [RT-F3/v2-F2]
+  if (_histChart) {
+    _histChart.destroy();
+    _histChart = null;
+  }
+  _histSessionStart = newStartMs;
+  for (let i = 0; i < _histBuckets.length; i++) {
+    _histBuckets[i].t = _histSessionStart + i * HIST_BUCKET_MS;
+    _histBuckets[i].cache_read = 0;
+    _histBuckets[i].cache_5m = 0;
+    _histBuckets[i].cache_1h = 0;
+    _histBuckets[i].output = 0;
+    _histBuckets[i].input = 0;
+  }
+}
+
+function _handleSessionBoundary(d, isCatchup) {
+  const event = d.event;
+  const boundaryId = d.boundary_id;
+
+  // Dedup: skip if we already processed this boundary [RT-v2-F4]
+  if (event === 'window_reset' && boundaryId) {
+    if (boundaryId === _lastBoundaryId) return;
+    _lastBoundaryId = boundaryId;
+
+    // Recalibrate histogram on the real resets_at window
+    const newResetsAt = d.new_resets_at;
+    if (newResetsAt) {
+      _claudeResetsAt = newResetsAt;
+      const newResetsMs = new Date(newResetsAt).getTime();
+      if (!isNaN(newResetsMs)) {
+        _resetHistogram(newResetsMs - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
+      }
+    }
+
+    // Flash "Nouvelle fenêtre 5h" — defer if tab hidden [RT-F5/v2-F6]
+    if (!isCatchup) {
+      if (document.visibilityState === 'visible') {
+        _flashBoundary();
+      } else {
+        _pendingBoundaryFlash = true;
+      }
+    }
+  }
+
+  if (event === 'rate_limited' && !isCatchup) {
+    _showRateLimited(d.resets_at);
+  }
+}
+
+function _flashBoundary() {
+  const panel = document.getElementById('claudeUsagePanel');
+  if (!panel) return;
+  panel.style.border = '2px solid #22c55e';
+  const resetLabel = document.getElementById('claudeResetTimer');
+  const oldText = resetLabel?.textContent || '';
+  if (resetLabel) resetLabel.textContent = 'Nouvelle fenêtre 5h';
+  setTimeout(() => {
+    panel.style.border = '';
+    if (resetLabel) resetLabel.textContent = oldText;
+    _pendingBoundaryFlash = false;
+  }, 3000);
+}
+
+function _showRateLimited(resetsAt) {
+  document.getElementById('claudeBridgeDot').style.background = '#ef4444';
+  const msg = document.getElementById('claudeBreakerMsg');
+  msg.style.display = 'block';
+  if (resetsAt) {
+    const diffMs = new Date(resetsAt) - new Date();
+    if (diffMs > 0) {
+      const h = Math.floor(diffMs / 3600000);
+      const m = Math.floor((diffMs % 3600000) / 60000);
+      msg.textContent = `Rate limited — reset dans ${h}h${String(m).padStart(2,'0')}m`;
+    } else {
+      msg.textContent = 'Rate limited — reset imminent';
+    }
+  } else {
+    msg.textContent = 'Rate limited';
+  }
+}
+
+// visibilitychange — registered ONCE at load, not per event [RT-v2-F6]
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && _pendingBoundaryFlash) {
+    _flashBoundary();
+  }
+});
+
 // ── Claude.ai Usage Panel Logic ──────────────────────────────────────────────
 function _updateClaudeUsagePanel(d) {
   const fhPct = d.five_hour_pct ?? 0;
@@ -1528,8 +1624,8 @@ function _updateClaudeUsagePanel(d) {
   document.getElementById('claudeFiveHourPct').textContent = fhPct + '%';
   document.getElementById('claudeSevenDayPct').textContent = sdPct + '%';
 
-  // Reset timer — store for live ticking
-  if (fhReset) window._claudeFhResetAt = fhReset;
+  // Reset timer — store in closure for live ticking [RT-v2-F9]
+  if (fhReset) _claudeResetsAt = fhReset;
   _tickClaudeResetTimer();
 
   // Overage
@@ -1542,14 +1638,15 @@ function _updateClaudeUsagePanel(d) {
 }
 
 function _tickClaudeResetTimer() {
-  const fhReset = window._claudeFhResetAt;
+  const fhReset = _claudeResetsAt;
   if (!fhReset) return;
   const diffMs = new Date(fhReset) - new Date();
   const el = document.getElementById('claudeResetTimer');
   if (diffMs > 0) {
     const h = Math.floor(diffMs / 3600000);
     const m = Math.floor((diffMs % 3600000) / 60000);
-    el.textContent = `Reset ${h}h${String(m).padStart(2,'0')}m`;
+    const absTime = new Date(fhReset).toLocaleTimeString('fr-CA', {hour:'2-digit', minute:'2-digit'});
+    el.textContent = `Reset ${h}h${String(m).padStart(2,'0')}m (${absTime})`;
   } else {
     el.textContent = 'Reset imminent';
   }
