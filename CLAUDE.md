@@ -51,3 +51,13 @@ When the user asks for a cache audit:
 | Cache read | $0.30 (0.1x) |
 | Cache write 5m | $3.75 (1.25x) |
 | Cache write 1h | $6.00 (2.0x) |
+
+
+<!-- atlas:start:claude-code-dashboard -->
+## Atlas — projet claude-code-dashboard
+<!-- generated: 2026-03-30T19:16:48Z — regenerer via: python3 generate_atlas.py --project claude-code-dashboard -->
+<!-- 15 doc(s) exclus (parse errors) — carte potentiellement incomplete -->
+
+[[plans/plan-realtime-gauge-mitmproxy-sse]] (active) "Real-time gauge via mitmproxy SSE — flux temps réel proxy → dashboard EMA smooth"
+  |-- [[handoffs/handoff-dashboard-audit-gauge-fix-2026-03-25]] (active) "Audit multi-agent 11 bugs fixés + gauge animation fixée + plan realtime SSE p..."
+<!-- atlas:end:claude-code-dashboard -->
