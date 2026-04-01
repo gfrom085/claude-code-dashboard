@@ -246,7 +246,7 @@
   </div>
 
   <!-- S0c: Model Gauges (3 col) -->
-  <div id="gaugeGridModels" style="display:grid; grid-template-columns:repeat(5, 1fr); gap:16px;"></div>
+  <div id="gaugeGridModels" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:16px;"></div>
 
   <!-- S0d: Token Type Gauges (auto, min 380px per card) -->
   <div id="gaugeGridTypes" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:16px;"></div>
@@ -360,7 +360,7 @@ function initSSE() {
     sseActive = false;
   }
 }
-initSSE();
+// initSSE() deferred — called after factory gauge listeners are defined
 
 // ── Called from refresh() — no-op gauge, just update session count ──────────
 function updateGauge() {
@@ -1281,24 +1281,6 @@ _factoryGauges.haiku = TokenGauge.create(_gaugeGridModels, {
   ],
 });
 
-// ── API Calls gauge — call rate + cache behavior ──────────────────────────
-_factoryGauges.apiCalls = TokenGauge.create(_gaugeGridModels, {
-  id: 'api-calls', label: 'API Calls', unit: 'calls/min',
-  initialMax: 20,
-  segments: [
-    { from: 0, to: 0.30, color: '#64748b' }, { from: 0.30, to: 0.60, color: '#94a3b8' },
-    { from: 0.60, to: 0.80, color: '#e2e8f0' }, { from: 0.80, to: 1.00, color: '#f97316' },
-  ],
-  stats: [
-    { label: 'Total calls', id: 'total', initial: '0' },
-    { label: 'Cache hit rate', id: 'hitrate', initial: '—' },
-    { label: 'Avg cache read', id: 'avgread', initial: '—' },
-    { label: 'Avg cache write', id: 'avgwrite', initial: '—' },
-    { label: 'Avg output', id: 'avgout', initial: '—' },
-    { label: 'Write 5m / 1h', id: 'writeratio', initial: '—' },
-  ],
-});
-
 // ── SDK Sidequest gauge — cache hit/miss for keypoint-gen calls ────────────
 _factoryGauges.sdkSidequest = TokenGauge.create(_gaugeGridModels, {
   id: 'sdk-sidequest', label: 'SDK Sidequest', unit: 'calls/min',
@@ -1329,8 +1311,6 @@ const _acc = {
   sonnet:       { tokens: 0, cost: 0, calls: 0, read: 0, write: 0, input: 0, output: 0 },
   haiku:        { tokens: 0, cost: 0, calls: 0, read: 0, write: 0, input: 0, output: 0 },
   calls: 0,
-  // API calls cache tracking
-  api: { calls: 0, callsWithRead: 0, totalRead: 0, totalWrite5m: 0, totalWrite1h: 0, totalOutput: 0 },
   // SDK sidequest tracking
   sdk: { calls: 0, hits: 0, totalRead: 0, totalCreate: 0, cost: 0 },
 };
@@ -1355,6 +1335,18 @@ function _updateGaugeStat(gaugeKey, accKey) {
 function _handleMetricsEvent(e, isCatchup) {
     try {
       const d = JSON.parse(e.data);
+      const sampleTs = d.ts ? d.ts * 1000 : Date.now();  // ts is epoch seconds
+
+      // On first catchup event, recalibrate histogram to stream start time
+      if (isCatchup && _acc.calls === 0 && d.ts) {
+        _histSessionStart = sampleTs;
+        for (let i = 0; i < _histBuckets.length; i++) {
+          _histBuckets[i].t = _histSessionStart + i * HIST_BUCKET_MS;
+          _histBuckets[i].cache_read = 0; _histBuckets[i].cache_5m = 0;
+          _histBuckets[i].cache_1h = 0; _histBuckets[i].output = 0; _histBuckets[i].input = 0;
+        }
+      }
+
       const p = _getModelPricing(d.model);
       _acc.calls++;
 
@@ -1415,13 +1407,13 @@ function _handleMetricsEvent(e, isCatchup) {
                      + (cw1h / 1e6 * p.cache_1h) + (out / 1e6 * p.output)
                      + (inp / 1e6 * p.input);
       if (allTokens > 0) {
-        if (!isCatchup) _addCostToBucket({
+        _addCostToBucket({
           cache_read: cr / 1e6 * p.cache_read,
           cache_5m:  cw5 / 1e6 * p.cache_5m,
           cache_1h:  cw1h / 1e6 * p.cache_1h,
           output:    out / 1e6 * p.output,
           input:     inp / 1e6 * p.input,
-        });
+        }, sampleTs);
         if (!isCatchup) _factoryGauges[family].push(allTokens);
         const ma = _acc[family];
         ma.tokens += allTokens;
@@ -1450,24 +1442,6 @@ function _handleMetricsEvent(e, isCatchup) {
       document.getElementById('totalCostCalls').textContent = _acc.calls.toLocaleString();
       document.getElementById('totalCostTokens').textContent = _fmtTokens(totalTokens);
 
-      // API Calls gauge — push 1 "token" per call to get calls/min rate
-      if (!isCatchup) _factoryGauges.apiCalls.push(1000000);  // 1M = 1 call on the gauge (unit: calls/min)
-      const api = _acc.api;
-      api.calls++;
-      if (cr > 0) api.callsWithRead++;
-      api.totalRead += cr;
-      api.totalWrite5m += cw5;
-      api.totalWrite1h += cw1h;
-      api.totalOutput += out;
-      _factoryGauges.apiCalls.stat('total', api.calls.toLocaleString());
-      _factoryGauges.apiCalls.stat('hitrate', api.calls > 0 ? Math.round(api.callsWithRead / api.calls * 100) + '%' : '—');
-      _factoryGauges.apiCalls.stat('avgread', api.calls > 0 ? _fmtTokens(Math.round(api.totalRead / api.calls)) : '—');
-      _factoryGauges.apiCalls.stat('avgwrite', api.calls > 0 ? _fmtTokens(Math.round((api.totalWrite5m + api.totalWrite1h) / api.calls)) : '—');
-      _factoryGauges.apiCalls.stat('avgout', api.calls > 0 ? _fmtTokens(Math.round(api.totalOutput / api.calls)) : '—');
-      _factoryGauges.apiCalls.stat('writeratio', (api.totalWrite5m + api.totalWrite1h) > 0
-        ? _fmtTokens(api.totalWrite5m) + ' / ' + _fmtTokens(api.totalWrite1h)
-        : '—');
-
       // SDK Sidequest gauge — filter by source
       const isSdk = (d.source || '').startsWith('sdk-');
       if (isSdk) {
@@ -1493,19 +1467,17 @@ function _handleMetricsEvent(e, isCatchup) {
 
     } catch (_) { /* ignore malformed */ }
 }
-function _patchSSEForFactoryGauges() {
-  if (!sseSource) return;
-  sseSource.addEventListener('token', (e) => _handleMetricsEvent(e, false));
-  sseSource.addEventListener('catchup', (e) => _handleMetricsEvent(e, true));
-}
-// Patch after a short delay to ensure SSE is connected
-setTimeout(_patchSSEForFactoryGauges, 500);
-// Also re-patch on SSE reconnect
+// Override initSSE to attach gauge listeners before opening EventSource
 const _origInitSSE = initSSE;
 initSSE = function() {
   _origInitSSE();
-  setTimeout(_patchSSEForFactoryGauges, 500);
+  if (sseSource) {
+    sseSource.addEventListener('token', (e) => _handleMetricsEvent(e, false));
+    sseSource.addEventListener('catchup', (e) => _handleMetricsEvent(e, true));
+  }
 };
+// Now open SSE — listeners are attached synchronously before any events arrive
+initSSE();
 
 // ── Cost histogram — fixed 5h window, implicit progress bar ───────────────
 const HIST_BUCKET_MS = 300000;  // 5min per bar
@@ -1525,8 +1497,8 @@ function _getOrCreateBucket(ts) {
   return _histBuckets[idx];
 }
 
-function _addCostToBucket(costs) {
-  const bucket = _getOrCreateBucket(Date.now());
+function _addCostToBucket(costs, tsMs) {
+  const bucket = _getOrCreateBucket(tsMs || Date.now());
   if (!bucket) return;
   bucket.cache_read += costs.cache_read || 0;
   bucket.cache_5m  += costs.cache_5m  || 0;
