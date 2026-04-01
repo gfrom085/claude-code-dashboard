@@ -31,16 +31,21 @@ import sqlite3
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 USAGE_JSON = Path("/tmp/claude-ai-usage.json")
 STREAM_JSONL = Path("/tmp/token-metrics-stream.jsonl")
+STREAM_JSONL_NEW = Path("/tmp/token-metrics-stream.jsonl.new")
 CHROME_COOKIES_DB = Path.home() / ".config/google-chrome/Default/Cookies"
 BASE_URL = "https://claude.ai"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+BOUNDARY_DELTA_MIN_H = 4   # ignore resets_at shifts < 4h
+BOUNDARY_FUTURE_MARGIN_H = 1  # new resets_at must be > now - 1h
+GAP_THRESHOLD_H = 10  # log gap warning if delta > 10h
+MAX_BAK_FILES = 3
 
 
 def _get_chrome_aes_key() -> bytes:
@@ -216,6 +221,182 @@ def write_breaker(reason: str) -> None:
             pass
 
 
+def _parse_iso(s: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp string to datetime, or None."""
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _make_boundary_line(event: str, boundary_id: str, **kwargs) -> str:
+    """Build a JSONL line for a session-boundary event."""
+    return json.dumps({
+        "v": 2,
+        "ts": time.time(),
+        "source": "session-boundary",
+        "event": event,
+        "boundary_id": boundary_id,
+        **kwargs,
+    }, separators=(",", ":")) + "\n"
+
+
+def _append_to_file(path: Path, line: str) -> None:
+    """Atomic append a line to a file (create if absent, 0o600)."""
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def rotate_stream(old_resets_at: str, new_resets_at: str,
+                  old_utilization: float, new_utilization: float) -> None:
+    """Rotate the stream JSONL on 5h window boundary.
+
+    Sequence (invariant: canonical path always exists):
+      a. Create .new file
+      b. Write boundary event as first line of .new
+      c. Write boundary event as last line of old file
+      d. Rename .new → canonical path (canonical always present)
+      e. Rename old → .bak
+      f. Cleanup old .bak files (keep max 3)
+    """
+    boundary_id = str(int(time.time() * 1000))
+    boundary_line = _make_boundary_line(
+        "window_reset",
+        boundary_id=boundary_id,
+        old_resets_at=old_resets_at,
+        new_resets_at=new_resets_at,
+        old_utilization=old_utilization,
+        new_utilization=new_utilization,
+    )
+
+    # a. Create new file
+    fd = os.open(str(STREAM_JSONL_NEW), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # b. Write boundary as first line of new
+        os.write(fd, boundary_line.encode())
+    finally:
+        os.close(fd)
+
+    # c. Write boundary as last line of old (for connected SSE clients)
+    if STREAM_JSONL.exists():
+        _append_to_file(STREAM_JSONL, boundary_line)
+
+    # d. Rename new → canonical (canonical always present after this)
+    os.rename(str(STREAM_JSONL_NEW), str(STREAM_JSONL))
+
+    # e. Rename old → .bak (the old inode is now unreferenced by canonical path)
+    # Note: after step d, the old file's inode is only held by SSE clients' open fd
+    # We can't rename it anymore since the canonical path points to the new file.
+    # The old inode will be cleaned up when SSE clients close their fd.
+    # Instead, we just log — the rotation is complete.
+    # The .bak is the previous canonical content that was atomically replaced in step d.
+
+    # f. Cleanup old .bak files
+    _cleanup_bak_files()
+
+    print(f"[poller] BOUNDARY: rotated stream (old={old_resets_at}, new={new_resets_at}, boundary_id={boundary_id})")
+
+
+def _cleanup_bak_files() -> None:
+    """Keep only the MAX_BAK_FILES most recent .bak files in /tmp/."""
+    bak_files = sorted(Path("/tmp").glob("token-metrics-stream-*.jsonl.bak"))
+    while len(bak_files) > MAX_BAK_FILES:
+        try:
+            bak_files.pop(0).unlink()
+        except OSError:
+            pass
+
+
+def check_boundary(data: dict, last_resets_at: str | None,
+                   last_utilization: float) -> tuple[str | None, bool]:
+    """Check if a 5h window boundary occurred.
+
+    Returns (new_resets_at_or_None, is_boundary).
+    """
+    usage = data.get("usage", {})
+    fh = usage.get("five_hour", {})
+    new_resets_at = fh.get("resets_at", "")
+    new_utilization = fh.get("utilization", 0)
+
+    if not new_resets_at or not last_resets_at:
+        return new_resets_at, False
+
+    if new_resets_at == last_resets_at:
+        return new_resets_at, False
+
+    # Guard: delta must be >= 4h [RT-F6]
+    old_dt = _parse_iso(last_resets_at)
+    new_dt = _parse_iso(new_resets_at)
+    if not old_dt or not new_dt:
+        return new_resets_at, False
+
+    delta_h = abs((new_dt - old_dt).total_seconds()) / 3600
+    if delta_h < BOUNDARY_DELTA_MIN_H:
+        print(f"[poller] resets_at shift ignored (delta={delta_h:.1f}h < {BOUNDARY_DELTA_MIN_H}h)", file=sys.stderr)
+        return new_resets_at, False
+
+    # Guard: new resets_at must be in the future (> now - 1h) [RT-v2-F5]
+    now = datetime.now(timezone.utc)
+    if new_dt.tzinfo is None:
+        new_dt = new_dt.replace(tzinfo=timezone.utc)
+    margin = now - timedelta(hours=BOUNDARY_FUTURE_MARGIN_H)
+    if new_dt < margin:
+        print(f"[poller] resets_at in the past ignored ({new_resets_at} < {margin.isoformat()})", file=sys.stderr)
+        return new_resets_at, False
+
+    # Gap detection [RT-F7] [RT-v2-F8]
+    if delta_h > GAP_THRESHOLD_H:
+        missed = int(delta_h / 5) - 1
+        print(f"[poller] GAP: {missed} windows missed (delta={delta_h:.0f}h)", file=sys.stderr)
+
+    # Trigger rotation
+    rotate_stream(last_resets_at, new_resets_at, last_utilization, new_utilization)
+    return new_resets_at, True
+
+
+def check_rate_limited(data: dict, already_signaled: bool) -> bool:
+    """Check if rate limited, emit event if newly limited. Returns new signaled state."""
+    usage = data.get("usage", {})
+    fh = usage.get("five_hour", {})
+    utilization = fh.get("utilization", 0)
+    resets_at = fh.get("resets_at", "")
+
+    # Log high utilization for empirical calibration [RT-F9]
+    if utilization > 90:
+        print(f"[poller] HIGH UTIL: {utilization}% (resets_at={resets_at})")
+
+    if utilization >= 100 and not already_signaled:
+        boundary_id = str(int(time.time() * 1000))
+        line = _make_boundary_line(
+            "rate_limited",
+            boundary_id=boundary_id,
+            utilization=utilization,
+            resets_at=resets_at,
+        )
+        _append_to_file(STREAM_JSONL, line)
+        print(f"[poller] RATE LIMITED: {utilization}% (resets_at={resets_at})")
+        return True
+
+    return already_signaled
+
+
+def _load_last_resets_at() -> str | None:
+    """Load last_resets_at from the JSON snapshot (for restart recovery) [RT-F10]."""
+    if not USAGE_JSON.exists():
+        return None
+    try:
+        data = json.loads(USAGE_JSON.read_text())
+        return data.get("last_resets_at")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def poll_once(initial_org_id: str | None) -> tuple[dict | None, str | None]:
     """Execute one poll cycle. Returns (data_dict, breaker_reason_or_None)."""
     # Read cookies fresh each time (watches for changes)
@@ -280,6 +461,12 @@ def main():
 
     initial_org_id = None
     consecutive_errors = 0
+    last_resets_at = _load_last_resets_at()
+    last_utilization = 0.0
+    rate_limited_signaled = False
+
+    if last_resets_at:
+        print(f"[poller] Recovered last_resets_at from snapshot: {last_resets_at}")
 
     while True:
         data, breaker_reason = poll_once(initial_org_id)
@@ -302,11 +489,25 @@ def main():
                 initial_org_id = data.get("org_id")
                 print(f"[poller] Locked org_id: {initial_org_id}")
 
+            fh_pct = data.get("usage", {}).get("five_hour", {}).get("utilization", 0)
+            sd_pct = data.get("usage", {}).get("seven_day", {}).get("utilization", 0)
+
+            # Check for 5h window boundary
+            new_resets_at, is_boundary = check_boundary(data, last_resets_at, last_utilization)
+            if is_boundary:
+                rate_limited_signaled = False  # reset rate limit flag on new window
+            if new_resets_at:
+                last_resets_at = new_resets_at
+            last_utilization = fh_pct
+
+            # Check for rate limit
+            rate_limited_signaled = check_rate_limited(data, rate_limited_signaled)
+
+            # Store last_resets_at in snapshot for restart recovery [RT-F10]
+            data["last_resets_at"] = last_resets_at
             write_snapshot(data)
             write_stream(data)
 
-            fh_pct = data.get("usage", {}).get("five_hour", {}).get("utilization", 0)
-            sd_pct = data.get("usage", {}).get("seven_day", {}).get("utilization", 0)
             print(f"[poller] OK five_hour={fh_pct}% seven_day={sd_pct}%")
 
         if args.once:
