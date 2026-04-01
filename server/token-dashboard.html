@@ -1476,9 +1476,9 @@ function _handleMetricsEvent(e, isCatchup) {
       document.getElementById('totalCostCalls').textContent = _acc.calls.toLocaleString();
       document.getElementById('totalCostTokens').textContent = _fmtTokens(totalTokens);
 
-      // Claude.ai Usage panel — filter by source
+      // Claude.ai Usage panel — filter by source (skip catchup to avoid stale data)
       if (d.source === 'claude-ai-usage') {
-        _updateClaudeUsagePanel(d);
+        if (!isCatchup) _updateClaudeUsagePanel(d);
         return;  // not a token event, skip gauge processing
       }
 

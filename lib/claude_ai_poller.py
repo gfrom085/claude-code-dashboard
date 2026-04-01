@@ -69,19 +69,19 @@ def _decrypt_v11(encrypted: bytes, aes_key: bytes) -> str:
 
     iv = b" " * 16
     ct = encrypted[3:]
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
-    raw = cipher.decryptor().update(ct) + cipher.decryptor().finalize()
-
-    # PKCS7 unpad
     dec = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
     raw = dec.update(ct) + dec.finalize()
+
+    # PKCS7 unpad
     pad = raw[-1]
     if 1 <= pad <= 16 and all(b == pad for b in raw[-pad:]):
         raw = raw[:-pad]
 
     text = raw.decode("latin1")
-    # First block is IV-XOR garbage. Find first run of printable ASCII (>= 8 chars).
-    m = re.search(r"[a-zA-Z0-9%._\-]{8,}", text)
+    # First AES block (16 bytes) is IV-XOR garbage in CBC mode.
+    # Find the cookie value: longest run of printable ASCII after the garbage.
+    # Covers: alphanumeric, base64 (+/=), percent-encoding (%), dots, dashes, underscores
+    m = re.search(r"[a-zA-Z0-9%._+/=\-]{4,}", text)
     return m.group(0) if m else text
 
 
@@ -93,7 +93,9 @@ def read_chrome_cookies(names: list[str]) -> dict[str, str]:
     aes_key = _get_chrome_aes_key()
 
     # Copy DB to avoid locking issues with running Chrome
-    tmp_db = tempfile.mktemp(suffix=".db")
+    fd, tmp_db = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.chmod(tmp_db, 0o600)
     shutil.copy2(CHROME_COOKIES_DB, tmp_db)
     try:
         conn = sqlite3.connect(tmp_db)
@@ -125,7 +127,9 @@ def fetch_api(path: str, cookie_str: str) -> tuple[int, dict | None]:
         return resp.status, json.loads(resp.read())
     except HTTPError as e:
         return e.code, None
-    except (URLError, json.JSONDecodeError, OSError):
+    except (URLError, json.JSONDecodeError, OSError) as e:
+        # Log without exposing cookie_str in stack trace
+        print(f"[poller] fetch error on {path}: {type(e).__name__}", file=sys.stderr)
         return 0, None
 
 
@@ -182,7 +186,7 @@ def write_stream(data: dict) -> None:
     }, separators=(",", ":")) + "\n"
 
     try:
-        fd = os.open(str(STREAM_JSONL), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        fd = os.open(str(STREAM_JSONL), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, line.encode())
         finally:
