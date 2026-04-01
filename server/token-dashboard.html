@@ -1558,9 +1558,12 @@ function _setClaudeBreakerState(reason) {
   msg.textContent = 'Bridge: ' + (reason || 'offline');
 }
 
-// Fetch initial state from REST API
-fetch('/api/claude-usage').then(r => r.json()).then(d => {
-  if (d.bridge_ok && d.usage) {
+// Fetch claude.ai usage from REST API (initial + periodic refresh)
+function _fetchClaudeUsage() {
+  fetch('/api/claude-usage').then(r => r.json()).then(d => {
+  if (d.age_seconds > 600) {
+      _setClaudeBreakerState('stale data (' + Math.round(d.age_seconds / 60) + 'min old)');
+    } else if (d.bridge_ok && d.usage) {
     const fh = d.usage.five_hour || {};
     const sd = d.usage.seven_day || {};
     const spend = d.spend || {};
@@ -1577,9 +1580,13 @@ fetch('/api/claude-usage').then(r => r.json()).then(d => {
   } else if (d.breaker === 'tripped') {
     _setClaudeBreakerState(d.reason);
   }
-}).catch(() => {
-  document.getElementById('claudeBridgeDot').style.background = '#666';
-});
+  }).catch(() => {
+    document.getElementById('claudeBridgeDot').style.background = '#666';
+  });
+}
+_fetchClaudeUsage();
+// Refresh every 2 min to detect stale data / poller death
+setInterval(_fetchClaudeUsage, 120000);
 
 // Override initSSE to attach gauge listeners before opening EventSource
 const _origInitSSE = initSSE;
