@@ -538,8 +538,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"bridge_ok": False, "error": "Poller not running — no data file"}, 503)
             return
         try:
+            mtime = CLAUDE_USAGE_JSON.stat().st_mtime
             data = json.loads(CLAUDE_USAGE_JSON.read_text())
-            age = time.time() - CLAUDE_USAGE_JSON.stat().st_mtime
+            age = time.time() - mtime
             data["bridge_ok"] = data.get("breaker") == "ok" and age < 600
             data["age_seconds"] = round(age)
             self.send_json(data)

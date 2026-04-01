@@ -1528,19 +1528,9 @@ function _updateClaudeUsagePanel(d) {
   document.getElementById('claudeFiveHourPct').textContent = fhPct + '%';
   document.getElementById('claudeSevenDayPct').textContent = sdPct + '%';
 
-  // Reset timer
-  if (fhReset) {
-    const resetDate = new Date(fhReset);
-    const now = new Date();
-    const diffMs = resetDate - now;
-    if (diffMs > 0) {
-      const h = Math.floor(diffMs / 3600000);
-      const m = Math.floor((diffMs % 3600000) / 60000);
-      document.getElementById('claudeResetTimer').textContent = `Reset ${h}h${m}m`;
-    } else {
-      document.getElementById('claudeResetTimer').textContent = 'Reset imminent';
-    }
-  }
+  // Reset timer — store for live ticking
+  if (fhReset) window._claudeFhResetAt = fhReset;
+  _tickClaudeResetTimer();
 
   // Overage
   const fmt = (cents) => (cents / 100).toFixed(2) + ' ' + currency;
@@ -1551,11 +1541,45 @@ function _updateClaudeUsagePanel(d) {
   document.getElementById('claudeBridgeDot').style.background = '#22c55e';
 }
 
+function _tickClaudeResetTimer() {
+  const fhReset = window._claudeFhResetAt;
+  if (!fhReset) return;
+  const diffMs = new Date(fhReset) - new Date();
+  const el = document.getElementById('claudeResetTimer');
+  if (diffMs > 0) {
+    const h = Math.floor(diffMs / 3600000);
+    const m = Math.floor((diffMs % 3600000) / 60000);
+    el.textContent = `Reset ${h}h${String(m).padStart(2,'0')}m`;
+  } else {
+    el.textContent = 'Reset imminent';
+  }
+}
+setInterval(_tickClaudeResetTimer, 60000);
+
+const _breakerMessages = {
+  'no_session_cookie': 'Cookie de session absent — reconnecte-toi à claude.ai',
+  'no_org_id': 'Organisation introuvable — reconnecte-toi à claude.ai',
+  'consecutive_errors': 'Erreurs réseau répétées — vérifie ta connexion',
+};
+function _humanizeBreaker(reason) {
+  if (!reason) return 'Bridge offline';
+  for (const [prefix, msg] of Object.entries(_breakerMessages)) {
+    if (reason.startsWith(prefix)) return msg;
+  }
+  if (reason.startsWith('org_changed')) return 'Compte switché — relance le poller';
+  if (reason.startsWith('http_401') || reason.startsWith('http_403')) return 'Session expirée — reconnecte-toi à claude.ai';
+  if (reason.startsWith('rate_limited')) return 'Rate limited — poller en pause';
+  if (reason.startsWith('schema_invalid')) return 'API claude.ai a changé — mise à jour requise';
+  if (reason.startsWith('stale')) return reason;  // already human-readable from frontend
+  return reason;
+}
+
 function _setClaudeBreakerState(reason) {
   document.getElementById('claudeBridgeDot').style.background = '#ef4444';
   const msg = document.getElementById('claudeBreakerMsg');
   msg.style.display = 'block';
-  msg.textContent = 'Bridge: ' + (reason || 'offline');
+  msg.textContent = _humanizeBreaker(reason);
+  msg.title = reason || '';  // raw reason in tooltip for debugging
 }
 
 // Fetch claude.ai usage from REST API (initial + periodic refresh)
