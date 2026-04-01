@@ -1522,6 +1522,28 @@ let _claudeResetsAt = null;       // closure, not window.* [RT-v2-F9]
 let _pendingBoundaryFlash = false;
 let _histCalibratedFromSignal = false;  // true once histogram is calibrated on real resets_at
 
+function _resetAccumulators() {
+  // Zero all cost/token accumulators — called on window boundary
+  for (const key of ['cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'output', 'input']) {
+    _acc[key].tokens = 0; _acc[key].cost = 0;
+  }
+  for (const key of ['opus', 'sonnet', 'haiku']) {
+    _acc[key].tokens = 0; _acc[key].cost = 0; _acc[key].calls = 0;
+    _acc[key].read = 0; _acc[key].write = 0; _acc[key].input = 0; _acc[key].output = 0;
+  }
+  _acc.calls = 0;
+  _acc.sdk.calls = 0; _acc.sdk.hits = 0; _acc.sdk.totalRead = 0;
+  _acc.sdk.totalCreate = 0; _acc.sdk.cost = 0;
+
+  // Update the total cost card to show $0.00
+  document.getElementById('totalCostValue').textContent = '$0.00';
+  document.getElementById('totalCostOpus').textContent = '$0.00';
+  document.getElementById('totalCostSonnet').textContent = '$0.00';
+  document.getElementById('totalCostHaiku').textContent = '$0.00';
+  document.getElementById('totalCostCalls').textContent = '0';
+  document.getElementById('totalCostTokens').textContent = '0';
+}
+
 function _resetHistogram(newStartMs) {
   // Atomically destroy Chart.js instance + clear buckets + reallocate [RT-F3/v2-F2]
   if (_histChart) {
@@ -1557,6 +1579,8 @@ function _handleSessionBoundary(d, isCatchup) {
         _resetHistogram(newResetsMs - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
         _histCalibratedFromSignal = true;
       }
+      // Reset all accumulators — new window = new cost totals
+      _resetAccumulators();
     }
 
     // Flash "Nouvelle fenêtre 5h" — defer if tab hidden [RT-F5/v2-F6]
