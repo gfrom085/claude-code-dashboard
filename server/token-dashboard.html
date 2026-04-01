@@ -1380,11 +1380,19 @@ function _handleMetricsEvent(e, isCatchup) {
       // Early-return for claude-ai-usage events (skip catchup to avoid stale data)
       if (d.source === 'claude-ai-usage') {
         if (!isCatchup) _updateClaudeUsagePanel(d);
+        // Recalibrate histogram on resets_at signal (SSE live events only, not catchup)
+        if (d.five_hour_resets_at && !_histCalibratedFromSignal) {
+          const resetsMs = new Date(d.five_hour_resets_at).getTime();
+          if (!isNaN(resetsMs)) {
+            _resetHistogram(resetsMs - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
+            _histCalibratedFromSignal = true;
+          }
+        }
         return;
       }
 
-      // On first catchup event, recalibrate histogram to cover last 5h
-      if (isCatchup && _acc.calls === 0) {
+      // On first catchup event, recalibrate histogram — but only if not already calibrated from signal
+      if (isCatchup && _acc.calls === 0 && !_histCalibratedFromSignal) {
         _resetHistogram(Date.now() - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
       }
 
@@ -1512,6 +1520,7 @@ function _handleMetricsEvent(e, isCatchup) {
 let _lastBoundaryId = null;       // dedup boundary events [RT-v2-F4]
 let _claudeResetsAt = null;       // closure, not window.* [RT-v2-F9]
 let _pendingBoundaryFlash = false;
+let _histCalibratedFromSignal = false;  // true once histogram is calibrated on real resets_at
 
 function _resetHistogram(newStartMs) {
   // Atomically destroy Chart.js instance + clear buckets + reallocate [RT-F3/v2-F2]
@@ -1546,6 +1555,7 @@ function _handleSessionBoundary(d, isCatchup) {
       const newResetsMs = new Date(newResetsAt).getTime();
       if (!isNaN(newResetsMs)) {
         _resetHistogram(newResetsMs - HIST_MAX_BUCKETS * HIST_BUCKET_MS);
+        _histCalibratedFromSignal = true;
       }
     }
 
@@ -1625,7 +1635,17 @@ function _updateClaudeUsagePanel(d) {
   document.getElementById('claudeSevenDayPct').textContent = sdPct + '%';
 
   // Reset timer — store in closure for live ticking [RT-v2-F9]
-  if (fhReset) _claudeResetsAt = fhReset;
+  if (fhReset) {
+    _claudeResetsAt = fhReset;
+    // Always calibrate histogram on real resets_at from REST/SSE
+    const resetsMs = new Date(fhReset).getTime();
+    const expectedStart = resetsMs - HIST_MAX_BUCKETS * HIST_BUCKET_MS;
+    if (!isNaN(resetsMs) && Math.abs(_histSessionStart - expectedStart) > 60000) {
+      // Only reset if the origin actually changed (> 1min drift)
+      _resetHistogram(expectedStart);
+      _histCalibratedFromSignal = true;
+    }
+  }
   _tickClaudeResetTimer();
 
   // Overage
