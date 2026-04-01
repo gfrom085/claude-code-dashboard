@@ -71,3 +71,14 @@ def write_sdk_call(
         os.write(fd, line.encode())
     finally:
         os.close(fd)
+
+    # Also write to the real-time stream so SSE gauges can see SDK calls
+    STREAM = "/tmp/token-metrics-stream.jsonl"
+    try:
+        sfd = os.open(STREAM, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(sfd, line.encode())
+        finally:
+            os.close(sfd)
+    except OSError:
+        pass  # stream absent = mitmproxy not running, not critical
