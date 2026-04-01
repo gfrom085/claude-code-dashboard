@@ -245,6 +245,40 @@
     </div>
   </div>
 
+  <!-- Claude.ai Usage Panel -->
+  <div id="claudeUsagePanel" class="gauge-section" style="margin-bottom:16px; padding:12px 16px; border-radius:8px; background:var(--bg-card, #1e1e2e);">
+    <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+      <span id="claudeBridgeDot" style="width:8px;height:8px;border-radius:50%;background:#666;display:inline-block;"></span>
+      <span style="font-weight:600; font-size:14px; color:var(--text, #cdd6f4);">Claude.ai Usage</span>
+      <span id="claudeResetTimer" style="margin-left:auto; font-size:11px; color:var(--subtext, #a6adc8);"></span>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+      <!-- Five Hour bar -->
+      <div>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--subtext, #a6adc8); margin-bottom:3px;">
+          <span>5h session</span><span id="claudeFiveHourPct">—</span>
+        </div>
+        <div style="background:var(--bg-bar, #313244); border-radius:4px; height:14px; overflow:hidden;">
+          <div id="claudeFiveHourBar" style="height:100%; width:0%; border-radius:4px; transition:width 0.5s ease, background 0.5s ease; background:#22c55e;"></div>
+        </div>
+      </div>
+      <!-- Seven Day bar -->
+      <div>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--subtext, #a6adc8); margin-bottom:3px;">
+          <span>7d rolling</span><span id="claudeSevenDayPct">—</span>
+        </div>
+        <div style="background:var(--bg-bar, #313244); border-radius:4px; height:14px; overflow:hidden;">
+          <div id="claudeSevenDayBar" style="height:100%; width:0%; border-radius:4px; transition:width 0.5s ease, background 0.5s ease; background:#22c55e;"></div>
+        </div>
+      </div>
+    </div>
+    <div id="claudeOverageRow" style="display:flex; gap:16px; margin-top:8px; font-size:11px; color:var(--subtext, #a6adc8);">
+      <span>Overage: <strong id="claudeOverageSpend">—</strong></span>
+      <span>Prepaid: <strong id="claudePrepaid">—</strong></span>
+    </div>
+    <div id="claudeBreakerMsg" style="display:none; margin-top:6px; font-size:11px; color:#ef4444;"></div>
+  </div>
+
   <!-- S0c: Model Gauges (3 col) -->
   <div id="gaugeGridModels" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:16px;"></div>
 
@@ -1442,6 +1476,12 @@ function _handleMetricsEvent(e, isCatchup) {
       document.getElementById('totalCostCalls').textContent = _acc.calls.toLocaleString();
       document.getElementById('totalCostTokens').textContent = _fmtTokens(totalTokens);
 
+      // Claude.ai Usage panel — filter by source
+      if (d.source === 'claude-ai-usage') {
+        _updateClaudeUsagePanel(d);
+        return;  // not a token event, skip gauge processing
+      }
+
       // SDK Sidequest gauge — filter by source
       const isSdk = (d.source || '').startsWith('sdk-');
       if (isSdk) {
@@ -1467,6 +1507,80 @@ function _handleMetricsEvent(e, isCatchup) {
 
     } catch (_) { /* ignore malformed */ }
 }
+// ── Claude.ai Usage Panel Logic ──────────────────────────────────────────────
+function _updateClaudeUsagePanel(d) {
+  const fhPct = d.five_hour_pct ?? 0;
+  const sdPct = d.seven_day_pct ?? 0;
+  const fhReset = d.five_hour_resets_at || '';
+  const overUsed = d.overage_used_cents ?? 0;
+  const overLimit = d.overage_limit_cents ?? 0;
+  const currency = d.overage_currency || 'USD';
+  const prepaid = d.prepaid_cents ?? 0;
+
+  // Bars
+  const fhBar = document.getElementById('claudeFiveHourBar');
+  const sdBar = document.getElementById('claudeSevenDayBar');
+  fhBar.style.width = fhPct + '%';
+  fhBar.style.background = fhPct > 80 ? '#ef4444' : fhPct > 50 ? '#eab308' : '#22c55e';
+  sdBar.style.width = sdPct + '%';
+  sdBar.style.background = sdPct > 80 ? '#ef4444' : sdPct > 50 ? '#eab308' : '#22c55e';
+
+  document.getElementById('claudeFiveHourPct').textContent = fhPct + '%';
+  document.getElementById('claudeSevenDayPct').textContent = sdPct + '%';
+
+  // Reset timer
+  if (fhReset) {
+    const resetDate = new Date(fhReset);
+    const now = new Date();
+    const diffMs = resetDate - now;
+    if (diffMs > 0) {
+      const h = Math.floor(diffMs / 3600000);
+      const m = Math.floor((diffMs % 3600000) / 60000);
+      document.getElementById('claudeResetTimer').textContent = `Reset ${h}h${m}m`;
+    } else {
+      document.getElementById('claudeResetTimer').textContent = 'Reset imminent';
+    }
+  }
+
+  // Overage
+  const fmt = (cents) => (cents / 100).toFixed(2) + ' ' + currency;
+  document.getElementById('claudeOverageSpend').textContent = fmt(overUsed) + ' / ' + fmt(overLimit);
+  document.getElementById('claudePrepaid').textContent = fmt(prepaid);
+
+  // Bridge dot
+  document.getElementById('claudeBridgeDot').style.background = '#22c55e';
+}
+
+function _setClaudeBreakerState(reason) {
+  document.getElementById('claudeBridgeDot').style.background = '#ef4444';
+  const msg = document.getElementById('claudeBreakerMsg');
+  msg.style.display = 'block';
+  msg.textContent = 'Bridge: ' + (reason || 'offline');
+}
+
+// Fetch initial state from REST API
+fetch('/api/claude-usage').then(r => r.json()).then(d => {
+  if (d.bridge_ok && d.usage) {
+    const fh = d.usage.five_hour || {};
+    const sd = d.usage.seven_day || {};
+    const spend = d.spend || {};
+    const credits = d.credits || {};
+    _updateClaudeUsagePanel({
+      five_hour_pct: fh.utilization || 0,
+      five_hour_resets_at: fh.resets_at || '',
+      seven_day_pct: sd.utilization || 0,
+      overage_used_cents: spend.used_credits || 0,
+      overage_limit_cents: spend.monthly_credit_limit || 0,
+      overage_currency: spend.currency || 'USD',
+      prepaid_cents: credits.amount || 0,
+    });
+  } else if (d.breaker === 'tripped') {
+    _setClaudeBreakerState(d.reason);
+  }
+}).catch(() => {
+  document.getElementById('claudeBridgeDot').style.background = '#666';
+});
+
 // Override initSSE to attach gauge listeners before opening EventSource
 const _origInitSSE = initSSE;
 initSSE = function() {
