@@ -5,7 +5,10 @@ Token metrics dashboard + cache audit system for Claude Code sessions.
 ## Structure
 
 ```
-server/dashboard_server.py   # HTTP server: sidecar API + cache audit endpoint
+server/dashboard_server.py   # HTTP server: sidecar API + cache audit + claude-usage endpoint
+server/token-dashboard.html  # Frontend: gauges tokens + panel Claude.ai Usage
+lib/claude_ai_poller.py      # Daemon: poll claude.ai usage via Chrome cookie bridge
+lib/sdk_metrics.py           # Helper: dual-write SDK metrics (JSONL + stream)
 hooks/langfuse_hook.py       # Stop hook: trace to Langfuse + sidecar metrics
 scripts/cache_audit.py       # Standalone cache invalidation auditor
 ```
@@ -41,7 +44,81 @@ When the user asks for a cache audit:
 - `GET /api/cache-audit?session=<id>&project=<name>` - Run audit, returns JSON
 - `GET /api/sidecar` - Current sidecar metrics
 - `GET /api/task-counts` - Task tool usage per session
-- `GET /api/health` - Server health check
+- `GET /api/claude-usage` - Claude.ai usage data (five_hour, seven_day, overage, credits)
+- `GET /api/health` - Server health check (inclut `claude_ai_bridge` status)
+
+## Claude.ai Usage Poller — Maintenance
+
+### Architecture
+
+```
+Chrome Cookies DB → claude_ai_poller.py → /tmp/claude-ai-usage.json → dashboard_server.py → frontend
+     (AES v11)         (HTTP GET)              + stream JSONL              (REST + SSE)
+```
+
+Le poller lit `sessionKey` depuis Chrome (GNOME Keyring decrypt), poll l'API claude.ai, et écrit dans deux fichiers :
+- `/tmp/claude-ai-usage.json` — snapshot REST pour `/api/claude-usage`
+- `/tmp/token-metrics-stream.jsonl` — ligne SSE pour le gauge temps réel (`source: "claude-ai-usage"`)
+
+ADR : [[adrs/adr-chrome-cookie-bridge-over-mcp]]
+
+### Démarrage
+
+```bash
+# Poller (daemon, doit tourner en permanence)
+nohup python3 -u lib/claude_ai_poller.py > /tmp/claude-ai-poller.log 2>&1 &
+
+# Vérifier
+curl -s http://localhost:8765/api/claude-usage | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'ok={d[\"bridge_ok\"]} five_hour={d[\"usage\"][\"five_hour\"][\"utilization\"]}%')"
+```
+
+### Circuit Breaker
+
+Le poller se coupe automatiquement (exit code 2) sur :
+
+| Signal | Cause | Action |
+|--------|-------|--------|
+| `http_401/403` | Session expirée | Se reconnecter à claude.ai dans Chrome, relancer poller |
+| `http_429` | Rate limited | Attendre, relancer poller |
+| `org_changed` | Compte switché dans Chrome | Relancer poller (il re-lock le nouvel orgId) |
+| `schema_invalid` | API claude.ai a changé | Investiguer la réponse, adapter le code |
+| `consecutive_errors` | 2 erreurs réseau consécutives | Vérifier la connexion, relancer poller |
+| `no_session_cookie` | Pas connecté à claude.ai | Se connecter dans Chrome |
+
+**Quand le breaker trip :** le fichier `/tmp/claude-ai-usage.json` contient `"breaker": "tripped"` avec la raison. Le dashboard affiche un message FR dans le panel.
+
+### Diagnostic
+
+```bash
+# Log du poller
+tail -f /tmp/claude-ai-poller.log
+
+# Snapshot actuel
+cat /tmp/claude-ai-usage.json | python3 -m json.tool
+
+# Breaker tripped ?
+python3 -c "import json; d=json.load(open('/tmp/claude-ai-usage.json')); print(d['breaker'], d.get('reason',''))"
+
+# Le poller tourne ?
+pgrep -f claude_ai_poller || echo "POLLER DOWN"
+
+# Relancer après breaker
+python3 -u lib/claude_ai_poller.py --once  # test one-shot d'abord
+nohup python3 -u lib/claude_ai_poller.py > /tmp/claude-ai-poller.log 2>&1 &
+```
+
+### Polling adaptatif
+
+- `five_hour.utilization <= 80%` → poll toutes les **120s**
+- `five_hour.utilization > 80%` → poll toutes les **30s** (mode fast)
+- Configurable : `--interval 120 --high-threshold 80 --fast-interval 30`
+
+### Dépendances runtime
+
+- **Chrome** doit être ouvert (pour que la DB cookies soit à jour)
+- **GNOME Keyring** déverrouillé (automatique après login desktop)
+- **Python système** avec `gi.Secret` (PyGObject) et `cryptography` — préinstallés sur Ubuntu
+- **Pas besoin** d'un tab claude.ai ouvert ni de l'extension Chrome MCP
 
 ## Pricing (Sonnet)
 
