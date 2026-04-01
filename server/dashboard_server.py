@@ -28,6 +28,7 @@ DASHBOARD_FILE = Path(__file__).parent / "token-dashboard.html"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 METRICS_STREAM = Path("/tmp/token-metrics-stream.jsonl")
 SKIPS_FILE = Path("/tmp/token-metrics-skips")
+CLAUDE_USAGE_JSON = Path("/tmp/claude-ai-usage.json")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 
 # Task cache with 30s TTL
@@ -410,10 +411,32 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/metrics-health":
             self.send_json(_check_metrics_health())
 
+        elif path == "/api/claude-usage":
+            self._handle_claude_usage()
+
         elif path == "/api/health":
-            self.send_json({"ok": True, "sidecar_exists": SIDECAR_FILE.exists(),
-                            "sidecar_jsonl_exists": SIDECAR_JSONL.exists(),
-                            "metrics_stream_exists": METRICS_STREAM.exists()})
+            health = {"ok": True, "sidecar_exists": SIDECAR_FILE.exists(),
+                      "sidecar_jsonl_exists": SIDECAR_JSONL.exists(),
+                      "metrics_stream_exists": METRICS_STREAM.exists()}
+            # Add claude.ai bridge status
+            if CLAUDE_USAGE_JSON.exists():
+                try:
+                    cu = json.loads(CLAUDE_USAGE_JSON.read_text())
+                    polled_at = cu.get("polled_at", "")
+                    breaker = cu.get("breaker", "unknown")
+                    age = time.time() - CLAUDE_USAGE_JSON.stat().st_mtime
+                    health["claude_ai_bridge"] = {
+                        "ok": breaker == "ok" and age < 600,
+                        "breaker": breaker,
+                        "reason": cu.get("reason"),
+                        "polled_at": polled_at,
+                        "age_seconds": round(age),
+                    }
+                except (json.JSONDecodeError, OSError):
+                    health["claude_ai_bridge"] = {"ok": False, "breaker": "read_error"}
+            else:
+                health["claude_ai_bridge"] = {"ok": False, "breaker": "no_data"}
+            self.send_json(health)
 
         else:
             self.send_json({"error": "not found"}, 404)
@@ -508,6 +531,20 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.5)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # client disconnected
+
+    def _handle_claude_usage(self) -> None:
+        """Return claude.ai usage data from the poller's snapshot file."""
+        if not CLAUDE_USAGE_JSON.exists():
+            self.send_json({"bridge_ok": False, "error": "Poller not running — no data file"}, 503)
+            return
+        try:
+            data = json.loads(CLAUDE_USAGE_JSON.read_text())
+            age = time.time() - CLAUDE_USAGE_JSON.stat().st_mtime
+            data["bridge_ok"] = data.get("breaker") == "ok" and age < 600
+            data["age_seconds"] = round(age)
+            self.send_json(data)
+        except (json.JSONDecodeError, OSError) as e:
+            self.send_json({"bridge_ok": False, "error": str(e)}, 500)
 
     def _handle_cache_audit(self) -> None:
         """Run cache_audit.py and return results as JSON."""
