@@ -287,17 +287,21 @@ def rotate_stream(old_resets_at: str, new_resets_at: str,
     if STREAM_JSONL.exists():
         _append_to_file(STREAM_JSONL, boundary_line)
 
-    # d. Rename new → canonical (canonical always present after this)
+        # d. Hard-link old → .bak BEFORE overwriting canonical path
+        #    This preserves the old content under a .bak name while canonical still exists.
+        date_tag = old_resets_at[:10] if old_resets_at else "unknown"
+        bak_path = Path(f"/tmp/token-metrics-stream-{date_tag}.jsonl.bak")
+        try:
+            if bak_path.exists():
+                bak_path.unlink()  # remove stale .bak with same date
+            os.link(str(STREAM_JSONL), str(bak_path))
+        except OSError:
+            pass  # non-critical — .bak is for diagnostics only
+
+    # e. Rename new → canonical (atomic — canonical always present)
     os.rename(str(STREAM_JSONL_NEW), str(STREAM_JSONL))
 
-    # e. Rename old → .bak (the old inode is now unreferenced by canonical path)
-    # Note: after step d, the old file's inode is only held by SSE clients' open fd
-    # We can't rename it anymore since the canonical path points to the new file.
-    # The old inode will be cleaned up when SSE clients close their fd.
-    # Instead, we just log — the rotation is complete.
-    # The .bak is the previous canonical content that was atomically replaced in step d.
-
-    # f. Cleanup old .bak files
+    # f. Cleanup old .bak files (keep max 3)
     _cleanup_bak_files()
 
     print(f"[poller] BOUNDARY: rotated stream (old={old_resets_at}, new={new_resets_at}, boundary_id={boundary_id})")
@@ -387,12 +391,27 @@ def check_rate_limited(data: dict, already_signaled: bool) -> bool:
 
 
 def _load_last_resets_at() -> str | None:
-    """Load last_resets_at from the JSON snapshot (for restart recovery) [RT-F10]."""
+    """Load last_resets_at from the JSON snapshot (for restart recovery) [RT-F10].
+
+    Validates that the stored value is in the past (rejects corrupted future values).
+    """
     if not USAGE_JSON.exists():
         return None
     try:
         data = json.loads(USAGE_JSON.read_text())
-        return data.get("last_resets_at")
+        stored = data.get("last_resets_at")
+        if not stored:
+            return None
+        # Validate stored value is in the past [RT-F10]
+        dt = _parse_iso(stored)
+        if dt:
+            now = datetime.now(timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt > now + timedelta(hours=6):  # allow small future margin for timezone issues
+                print(f"[poller] Stored last_resets_at is too far in the future, ignoring: {stored}", file=sys.stderr)
+                return None
+        return stored
     except (json.JSONDecodeError, OSError):
         return None
 
