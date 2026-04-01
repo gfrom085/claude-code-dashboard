@@ -208,31 +208,48 @@
   <!-- Health Banner -->
   <div id="healthBanner" style="display:none; padding:10px 16px; font-size:13px; font-weight:600; border-radius:6px; margin-bottom:12px;"></div>
 
-  <!-- S0: Cache Throughput Gauge -->
-  <div class="gauge-section">
-    <div class="gauge-wrap">
-      <canvas id="gaugeCanvas" width="440" height="260"></canvas>
-      <div class="gauge-value" id="gaugeValue">0<span class="gauge-unit">M tok/min</span></div>
+  <!-- S0: Total cost card with histogram -->
+  <div id="totalCostCard" class="gauge-section" style="flex-direction:row; align-items:stretch; padding:20px 24px; gap:24px;">
+    <!-- Left: cost summary -->
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; min-width:200px; flex-shrink:0;">
+      <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:6px;">Coût total session</div>
+      <div id="totalCostValue" style="font-size:42px; font-weight:700; font-variant-numeric:tabular-nums; color:var(--text); line-height:1;">$0.00</div>
+      <div style="display:flex; gap:16px; margin-top:12px;">
+        <div style="text-align:center;">
+          <div style="font-size:10px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em;">Opus</div>
+          <div id="totalCostOpus" style="font-size:14px; font-weight:600; color:#f97316; font-variant-numeric:tabular-nums;">$0.00</div>
+        </div>
+        <div style="text-align:center;">
+          <div style="font-size:10px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em;">Sonnet</div>
+          <div id="totalCostSonnet" style="font-size:14px; font-weight:600; color:#8b5cf6; font-variant-numeric:tabular-nums;">$0.00</div>
+        </div>
+        <div style="text-align:center;">
+          <div style="font-size:10px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em;">Haiku</div>
+          <div id="totalCostHaiku" style="font-size:14px; font-weight:600; color:#22c55e; font-variant-numeric:tabular-nums;">$0.00</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:16px; margin-top:8px;">
+        <div style="text-align:center;">
+          <div style="font-size:10px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em;">Calls</div>
+          <div id="totalCostCalls" style="font-size:14px; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums;">0</div>
+        </div>
+        <div style="text-align:center;">
+          <div style="font-size:10px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em;">Tokens</div>
+          <div id="totalCostTokens" style="font-size:14px; font-weight:600; color:var(--text); font-variant-numeric:tabular-nums;">0</div>
+        </div>
+      </div>
     </div>
-    <div class="gauge-stats">
-      <div class="gauge-stat-row">
-        <span class="gauge-stat-label">Sessions actives</span>
-        <span class="gauge-stat-value" id="gaugeSessions">0</span>
-      </div>
-      <div class="gauge-stat-row">
-        <span class="gauge-stat-label">Cache read total</span>
-        <span class="gauge-stat-value" id="gaugeTotalRead">0</span>
-      </div>
-      <div class="gauge-stat-row">
-        <span class="gauge-stat-label">Pic session</span>
-        <span class="gauge-stat-value hot" id="gaugePeakSession">—</span>
-      </div>
-      <div class="gauge-stat-row">
-        <span class="gauge-stat-label">Coût read/min</span>
-        <span class="gauge-stat-value warm" id="gaugeCostMin">$0</span>
-      </div>
+    <!-- Right: stacked bar histogram -->
+    <div style="flex:1; min-height:120px; position:relative;">
+      <canvas id="costHistogramCanvas"></canvas>
     </div>
   </div>
+
+  <!-- S0c: Model Gauges (3 col) -->
+  <div id="gaugeGridModels" style="display:grid; grid-template-columns:repeat(5, 1fr); gap:16px;"></div>
+
+  <!-- S0d: Token Type Gauges (auto, min 380px per card) -->
+  <div id="gaugeGridTypes" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:16px;"></div>
 
   <!-- Cache Audit Results -->
   <div id="cacheAuditResults" style="display:none" class="gauge-section">
@@ -327,177 +344,12 @@ const collapsedGroups = new Set();
 let sseSource = null;
 let sseActive = false;
 
-// ── Polyphonic pulse model — each API call = independent pulse ───────────────
-const pulses = [];             // [{rate, ts}, ...] — cache_read only
-const PULSE_RAMP_MS = 500;    // ramp-up τ — reaches ~95% in 1.5s (3τ)
-const PULSE_DECAY_HL = 4000;  // decay half-life 4s — pulse halves every 4s
-const PULSE_DECAY_K = Math.LN2 / PULSE_DECAY_HL;
-const PULSE_DEAD = 0.005;     // cleanup threshold — pulse < 0.5% of peak
-
-// ── Gauge state ─────────────────────────────────────────────────────────────
-let prevCacheTotal = null;
-let prevCacheTs = null;
-let displayRate = 0;       // M tok/min — what the needle shows
-let peakRate = 0;
-let lastGaugeTs = null;
-let gaugeIntervalId = null;
-let GAUGE_MAX = 2;         // M tok/min — dynamic scale, starts at 2
-let _gaugeScaleDownCount = 0;
-
-// Cached gauge stats for display between polls
-let gaugeActiveSessions = 0;
-let gaugeTotalCacheRead = 0;
-let gaugePeakSid = '—';
-let gaugePeakSessionRate = 0;
-
-function drawGauge(rate) {
-  const canvas = document.getElementById('gaugeCanvas');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const cx = W / 2, cy = H - 20;
-  const R = Math.min(cx - 20, cy - 10);
-
-  ctx.clearRect(0, 0, W, H);
-
-  const startAngle = Math.PI;
-
-  // Gradient segments: green → yellow → orange → red
-  const segments = [
-    { from: 0,    to: 0.25, color: '#22c55e' },
-    { from: 0.25, to: 0.50, color: '#84cc16' },
-    { from: 0.50, to: 0.70, color: '#eab308' },
-    { from: 0.70, to: 0.85, color: '#f97316' },
-    { from: 0.85, to: 1.00, color: '#ef4444' },
-  ];
-
-  // Draw dim arc background
-  ctx.lineWidth = 18;
-  ctx.lineCap = 'butt';
-  for (const seg of segments) {
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, startAngle + seg.from * Math.PI, startAngle + seg.to * Math.PI);
-    ctx.strokeStyle = seg.color + '40';
-    ctx.stroke();
-  }
-
-  // Draw filled arc up to current rate
-  const pct = Math.min(rate / GAUGE_MAX, 1);
-  const filledEnd = startAngle + pct * Math.PI;
-  ctx.lineWidth = 18;
-  ctx.lineCap = 'round';
-  for (const seg of segments) {
-    const a1 = startAngle + seg.from * Math.PI;
-    const a2 = startAngle + seg.to * Math.PI;
-    if (a1 >= filledEnd) break;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, a1, Math.min(a2, filledEnd));
-    ctx.strokeStyle = seg.color;
-    ctx.shadowColor = seg.color;
-    ctx.shadowBlur = 8;
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-  }
-
-  // Glow pulse on the arc tip when rate > 0
-  if (pct > 0.01) {
-    const tipX = cx + Math.cos(filledEnd) * R;
-    const tipY = cy + Math.sin(filledEnd) * R;
-    const tipSeg = segments.find(s => pct <= s.to) || segments[segments.length - 1];
-    const glow = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, 14);
-    glow.addColorStop(0, tipSeg.color + '80');
-    glow.addColorStop(1, tipSeg.color + '00');
-    ctx.beginPath();
-    ctx.arc(tipX, tipY, 14, 0, 2 * Math.PI);
-    ctx.fillStyle = glow;
-    ctx.fill();
-  }
-
-  // Needle
-  const needleAngle = startAngle + pct * Math.PI;
-  const needleLen = R - 25;
-  ctx.beginPath();
-  ctx.moveTo(cx, cy);
-  ctx.lineTo(cx + Math.cos(needleAngle) * needleLen, cy + Math.sin(needleAngle) * needleLen);
-  ctx.strokeStyle = '#e2e8f0';
-  ctx.lineWidth = 2.5;
-  ctx.lineCap = 'round';
-  ctx.shadowColor = '#e2e8f0';
-  ctx.shadowBlur = 6;
-  ctx.stroke();
-  ctx.shadowBlur = 0;
-
-  // Center dot
-  ctx.beginPath();
-  ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
-  ctx.fillStyle = '#e2e8f0';
-  ctx.fill();
-
-  // Scale labels
-  ctx.font = '11px Inter, system-ui, sans-serif';
-  ctx.fillStyle = '#64748b';
-  ctx.textAlign = 'center';
-  // Dynamic labels based on current GAUGE_MAX
-  const steps = [0, 0.1, 0.25, 0.5, 0.75, 1].map(f => Math.round(f * GAUGE_MAX));
-  for (const v of steps) {
-    const a = startAngle + (v / GAUGE_MAX) * Math.PI;
-    ctx.fillText(v + '', cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16) + 4);
-  }
-}
-
-// ── Gauge animation — polyphonic: sum of independent pulses ─────────────────
-const GAUGE_TICK_MS = 50;  // 20fps
-
-function gaugeTick() {
-  const now = performance.now();
-
-  // Sum all active pulses: each has its own ramp × decay envelope
-  let totalRate = 0;
-  for (let i = pulses.length - 1; i >= 0; i--) {
-    const p = pulses[i];
-    const age = now - p.ts;
-    const ramp = 1 - Math.exp(-age / PULSE_RAMP_MS);       // rises to ~95% in 4.5s
-    const decay = Math.exp(-PULSE_DECAY_K * age);           // halves every 8s
-    const val = p.rate * ramp * decay;
-    if (val < PULSE_DEAD && age > PULSE_RAMP_MS * 3) {
-      pulses.splice(i, 1);  // dead pulse, remove
-    } else {
-      totalRate += val;
-    }
-  }
-
-  displayRate = totalRate;
-  if (displayRate < 0.01) displayRate = 0;
-
-  drawGauge(displayRate);
-
-  document.getElementById('gaugeValue').innerHTML =
-    `${displayRate.toFixed(1)}<span class="gauge-unit">M tok/min</span>`;
-  const costMin = displayRate * 0.30;
-  document.getElementById('gaugeCostMin').textContent =
-    costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
-}
-
-function startGaugeAnim() {
-  if (!gaugeIntervalId) {
-    lastGaugeTs = null;
-    gaugeIntervalId = setInterval(gaugeTick, GAUGE_TICK_MS);
-  }
-}
-
-// ── SSE: real-time gauge feed — each sample creates a pulse ─────────────────
+// ── SSE: real-time feed — factory gauges handle all rendering ───────────────
 function initSSE() {
   if (sseSource) return;
   try {
     sseSource = new EventSource('/api/stream');
-    sseSource.addEventListener('token', (e) => {
-      sseActive = true;
-      try {
-        const d = JSON.parse(e.data);
-        const rate = (d.cache_read || 0) / 1e6;
-        if (rate > 0) pulses.push({ rate, ts: performance.now() });
-      } catch (_) { /* ignore malformed */ }
-    });
+    sseSource.addEventListener('token', (e) => { sseActive = true; });
     sseSource.onerror = () => {
       sseActive = false;
       sseSource.close();
@@ -510,69 +362,9 @@ function initSSE() {
 }
 initSSE();
 
-// ── Called from refresh() — computes raw rate from poll data ─────────────────
+// ── Called from refresh() — no-op gauge, just update session count ──────────
 function updateGauge() {
-  const active = getActiveSessions();
-  const totalCacheRead = active.reduce((sum, [, s]) =>
-    sum + (s.turns || []).reduce((a, t) => a + (t.cache_read || 0), 0), 0);
-  const tsNow = Date.now();
-
-  let rawRate = 0;
-  if (prevCacheTotal !== null && prevCacheTs !== null) {
-    const dtMin = (tsNow - prevCacheTs) / 60000;
-    if (dtMin > 0.01) {
-      const delta = totalCacheRead - prevCacheTotal;
-      rawRate = Math.max(0, delta / dtMin / 1e6);
-    }
-  }
-  prevCacheTotal = totalCacheRead;
-  prevCacheTs = tsNow;
-
-  // Poll fallback — create pulse only if SSE is not feeding
-  if (!sseActive && rawRate > 0.01) {
-    pulses.push({ rate: rawRate, ts: performance.now() });
-  }
-  if (rawRate > peakRate) peakRate = rawRate;
-
-  // Dynamic scale based on displayRate (sum of all pulses)
-  const dr = displayRate;
-  if (dr > GAUGE_MAX * 0.7) {
-    GAUGE_MAX = Math.ceil(dr / 5) * 5 * 2;  // round up, 2x headroom
-    _gaugeScaleDownCount = 0;
-  } else if (dr < GAUGE_MAX * 0.2 && GAUGE_MAX > 2) {
-    _gaugeScaleDownCount = (_gaugeScaleDownCount || 0) + 1;
-    if (_gaugeScaleDownCount >= 6) {
-      GAUGE_MAX = Math.max(2, Math.ceil(dr * 4) || 2);
-      _gaugeScaleDownCount = 0;
-    }
-  } else {
-    _gaugeScaleDownCount = 0;
-  }
-
-  // Update static stats (not animated)
-  gaugeActiveSessions = active.length;
-  gaugeTotalCacheRead = totalCacheRead;
-  document.getElementById('gaugeSessions').textContent = active.length;
-  document.getElementById('gaugeTotalRead').textContent = fmtTokens(totalCacheRead);
-
-  // Peak per-session rate
-  let peakSid = '—', peakSessionRate = 0;
-  for (const [sid, s] of active) {
-    const turns = [...(s.turns || [])].sort((a, b) => (a.ts||0) - (b.ts||0));
-    if (turns.length < 2) continue;
-    const last = turns[turns.length - 1];
-    const prev = turns[turns.length - 2];
-    if (last.ts && prev.ts && last.ts > prev.ts) {
-      const dt = (last.ts - prev.ts) / 60;
-      if (dt < 0.001) continue;
-      const r = (last.cache_read || 0) / dt / 1e6;
-      if (r > peakSessionRate) { peakSessionRate = r; peakSid = sid.substring(0, 8); }
-    }
-  }
-  document.getElementById('gaugePeakSession').textContent =
-    peakSessionRate > 0 ? `${peakSessionRate.toFixed(1)}M/min (${peakSid})` : '—';
-
-  startGaugeAnim();
+  // Factory gauges handle all rendering via SSE
 }
 const dot = document.getElementById('dot');
 const lastUpdated = document.getElementById('lastUpdated');
@@ -1185,6 +977,691 @@ function pollHealth() {
 
 setInterval(pollHealth, 60000);
 pollHealth();  // initial check
+</script>
+<script>
+// ── TokenGauge Factory (inlined — server only serves /) ───────────────────
+const TokenGauge = (() => {
+  const DEFAULTS = {
+    windowMs: 10000, needleTau: 1500, flashHoldMs: 50, flashDecayTau: 300,
+    scaleDownCooldown: 5000, tickMs: 50, initialMax: 2,
+    canvasWidth: 440, canvasHeight: 260, displayWidth: 220, displayHeight: 130,
+    zeroThreshold: 0.005, costPerMTok: null, unit: 'M tok/min', label: 'Gauge',
+  };
+  const SEGMENTS = {
+    GREEN_TO_RED: [
+      { from: 0, to: 0.25, color: '#22c55e' }, { from: 0.25, to: 0.50, color: '#84cc16' },
+      { from: 0.50, to: 0.70, color: '#eab308' }, { from: 0.70, to: 0.85, color: '#f97316' },
+      { from: 0.85, to: 1.00, color: '#ef4444' },
+    ],
+    BLUE_TO_PURPLE: [
+      { from: 0, to: 0.25, color: '#3b82f6' }, { from: 0.25, to: 0.50, color: '#6366f1' },
+      { from: 0.50, to: 0.70, color: '#8b5cf6' }, { from: 0.70, to: 0.85, color: '#a855f7' },
+      { from: 0.85, to: 1.00, color: '#ef4444' },
+    ],
+    AMBER_MONO: [
+      { from: 0, to: 0.50, color: '#f59e0b' }, { from: 0.50, to: 0.75, color: '#f97316' },
+      { from: 0.75, to: 1.00, color: '#ef4444' },
+    ],
+    COOL_MONO: [
+      { from: 0, to: 0.50, color: '#22c55e' }, { from: 0.50, to: 0.75, color: '#10b981' },
+      { from: 0.75, to: 1.00, color: '#14b8a6' },
+    ],
+  };
+  function buildDOM(container, id, opts) {
+    const section = document.createElement('div');
+    section.className = 'gauge-section'; section.id = `gauge-section-${id}`;
+    const wrap = document.createElement('div'); wrap.className = 'gauge-wrap';
+    const canvas = document.createElement('canvas');
+    canvas.id = `gaugeCanvas-${id}`; canvas.width = opts.canvasWidth; canvas.height = opts.canvasHeight;
+    canvas.style.width = opts.displayWidth + 'px'; canvas.style.height = opts.displayHeight + 'px';
+    const valueDiv = document.createElement('div'); valueDiv.className = 'gauge-value';
+    valueDiv.id = `gaugeValue-${id}`;
+    valueDiv.innerHTML = `0<span class="gauge-unit">${opts.unit}</span>`;
+    wrap.appendChild(canvas); wrap.appendChild(valueDiv); section.appendChild(wrap);
+    const stats = document.createElement('div'); stats.className = 'gauge-stats';
+    const titleRow = document.createElement('div'); titleRow.className = 'gauge-stat-row';
+    titleRow.innerHTML = `<span class="gauge-stat-label" style="font-size:13px;font-weight:600;text-transform:none;letter-spacing:0;color:var(--text)">${opts.label}</span>`;
+    stats.appendChild(titleRow);
+    if (opts.stats) {
+      for (const s of opts.stats) {
+        const row = document.createElement('div'); row.className = 'gauge-stat-row';
+        const cls = s.style ? ` ${s.style}` : '';
+        row.innerHTML = `<span class="gauge-stat-label">${s.label}</span><span class="gauge-stat-value${cls}" id="gaugeStat-${id}-${s.id}">${s.initial || '—'}</span>`;
+        stats.appendChild(row);
+      }
+    }
+    if (opts.costPerMTok !== null) {
+      const costRow = document.createElement('div'); costRow.className = 'gauge-stat-row';
+      costRow.innerHTML = `<span class="gauge-stat-label">Coût/min</span><span class="gauge-stat-value warm" id="gaugeCost-${id}">$0</span>`;
+      stats.appendChild(costRow);
+    }
+    section.appendChild(stats); container.appendChild(section);
+    return { canvas, valueDiv, section };
+  }
+  function _drawGauge(ctx, W, H, rate, gaugeMax, segments, flashTs, flashHoldMs, flashDecayTau) {
+    const cx = W / 2, cy = H - 20, R = Math.min(cx - 20, cy - 10), startAngle = Math.PI;
+    ctx.clearRect(0, 0, W, H);
+    ctx.lineWidth = 18; ctx.lineCap = 'butt';
+    for (const seg of segments) {
+      ctx.beginPath(); ctx.arc(cx, cy, R, startAngle + seg.from * Math.PI, startAngle + seg.to * Math.PI);
+      ctx.strokeStyle = seg.color + '40'; ctx.stroke();
+    }
+    const pct = Math.min(rate / gaugeMax, 1), filledEnd = startAngle + pct * Math.PI;
+    ctx.lineWidth = 18; ctx.lineCap = 'round';
+    for (const seg of segments) {
+      const a1 = startAngle + seg.from * Math.PI, a2 = startAngle + seg.to * Math.PI;
+      if (a1 >= filledEnd) break;
+      ctx.beginPath(); ctx.arc(cx, cy, R, a1, Math.min(a2, filledEnd));
+      ctx.strokeStyle = seg.color; ctx.shadowColor = seg.color; ctx.shadowBlur = 8;
+      ctx.stroke(); ctx.shadowBlur = 0;
+    }
+    if (pct > 0.01) {
+      const tipX = cx + Math.cos(filledEnd) * R, tipY = cy + Math.sin(filledEnd) * R;
+      const tipSeg = segments.find(s => pct <= s.to) || segments[segments.length - 1];
+      let fi = 0; const fa = performance.now() - flashTs;
+      if (fa < flashHoldMs) fi = 1.0; else fi = Math.exp(-(fa - flashHoldMs) / flashDecayTau);
+      const gr = 14 + fi * 10, ga = Math.round(0x80 + fi * 0x7f).toString(16).padStart(2, '0');
+      const glow = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, gr);
+      glow.addColorStop(0, tipSeg.color + ga); glow.addColorStop(1, tipSeg.color + '00');
+      ctx.beginPath(); ctx.arc(tipX, tipY, gr, 0, 2 * Math.PI); ctx.fillStyle = glow; ctx.fill();
+    }
+    const nAngle = startAngle + pct * Math.PI, nLen = R - 25;
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(nAngle) * nLen, cy + Math.sin(nAngle) * nLen);
+    ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+    ctx.shadowColor = '#e2e8f0'; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 2 * Math.PI); ctx.fillStyle = '#e2e8f0'; ctx.fill();
+    ctx.font = '11px Inter, system-ui, sans-serif'; ctx.fillStyle = '#64748b'; ctx.textAlign = 'center';
+    const steps = [0, 0.1, 0.25, 0.5, 0.75, 1].map(f => { const v = f * gaugeMax; return v >= 10 ? Math.round(v) : +v.toFixed(1); });
+    for (const v of steps) {
+      const a = startAngle + (v / gaugeMax) * Math.PI;
+      ctx.fillText(v + '', cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16) + 4);
+    }
+  }
+  function create(container, userOpts = {}) {
+    const opts = { ...DEFAULTS, ...userOpts };
+    const id = opts.id || 'gauge-' + Math.random().toString(36).slice(2, 8);
+    const segments = opts.segments || SEGMENTS.GREEN_TO_RED;
+    const buffer = []; let rawTPM = 0, displayRate = 0, gaugeMax = opts.initialMax;
+    let peakRate = 0, flashTs = 0, lastScaleChangeTs = 0, scaleDownCount = 0;
+    let lastScaleCheckTs = 0, intervalId = null;
+    const SCALE_CHECK_INTERVAL = 2000;
+    const dom = buildDOM(container, id, opts);
+    const canvasCtx = dom.canvas.getContext('2d');
+    const W = dom.canvas.width, H = dom.canvas.height;
+    const costEl = opts.costPerMTok !== null ? document.getElementById(`gaugeCost-${id}`) : null;
+    function tick() {
+      const now = performance.now();
+      let cutoff = 0;
+      while (cutoff < buffer.length && (now - buffer[cutoff].ts) > opts.windowMs) cutoff++;
+      if (cutoff > 0) buffer.splice(0, cutoff);
+      if (buffer.length > 0) {
+        const totalTokens = buffer.reduce((sum, s) => sum + s.tokens, 0);
+        const windowMs = Math.max(now - buffer[0].ts, 1000);
+        rawTPM = totalTokens / (windowMs / 60000) / 1e6;
+      } else { rawTPM = 0; }
+      const alpha = 1 - Math.exp(-opts.tickMs / opts.needleTau);
+      displayRate += alpha * (rawTPM - displayRate);
+      if (displayRate < opts.zeroThreshold) displayRate = 0;
+      if (rawTPM > peakRate) peakRate = rawTPM;
+      if (displayRate > gaugeMax * 0.7) {
+        gaugeMax = Math.max(opts.initialMax, Math.ceil(displayRate * 2));
+        lastScaleChangeTs = now; lastScaleCheckTs = now; scaleDownCount = 0;
+      } else if ((now - lastScaleCheckTs) >= SCALE_CHECK_INTERVAL) {
+        lastScaleCheckTs = now;
+        if (displayRate < gaugeMax * 0.2 && gaugeMax > opts.initialMax) {
+          scaleDownCount++;
+          if (scaleDownCount >= 6 && (now - lastScaleChangeTs) > opts.scaleDownCooldown) {
+            gaugeMax = Math.max(opts.initialMax, Math.ceil(displayRate * 4) || opts.initialMax);
+            lastScaleChangeTs = now; scaleDownCount = 0;
+          }
+        } else { scaleDownCount = 0; }
+      }
+      _drawGauge(canvasCtx, W, H, displayRate, gaugeMax, segments, flashTs, opts.flashHoldMs, opts.flashDecayTau);
+      dom.valueDiv.innerHTML = `${rawTPM.toFixed(1)}<span class="gauge-unit">${opts.unit}</span>`;
+      if (costEl) {
+        const costMin = rawTPM * opts.costPerMTok;
+        costEl.textContent = costMin > 0.005 ? `$${costMin.toFixed(2)}/min` : '$0';
+      }
+    }
+    function start() { if (!intervalId) intervalId = setInterval(tick, opts.tickMs); }
+    const instance = {
+      push(tokens) { if (tokens > 0) { buffer.push({ tokens, ts: performance.now() }); flashTs = performance.now(); } },
+      read() { return { raw: rawTPM, display: displayRate, peak: peakRate, max: gaugeMax, bufferSize: buffer.length }; },
+      stat(statId, value) { const el = document.getElementById(`gaugeStat-${id}-${statId}`); if (el) el.textContent = value; },
+      reset() { buffer.length = 0; rawTPM = 0; displayRate = 0; peakRate = 0; gaugeMax = opts.initialMax; scaleDownCount = 0; flashTs = 0; },
+      destroy() { if (intervalId) { clearInterval(intervalId); intervalId = null; } buffer.length = 0; dom.section.remove(); },
+      get el() { return dom.section; },
+      get max() { return gaugeMax; },
+      set max(v) { gaugeMax = v; lastScaleChangeTs = performance.now(); },
+    };
+    start();
+    _drawGauge(canvasCtx, W, H, 0, gaugeMax, segments, 0, opts.flashHoldMs, opts.flashDecayTau);
+    return instance;
+  }
+  return { create, SEGMENTS, DEFAULTS };
+})();
+</script>
+<script>
+// ── Model pricing table ($/MTok) — source: docs.anthropic.com 2026-03 ──────
+const MODEL_PRICING = {
+  // Opus 4.6 / 4.5
+  'claude-opus-4-6':   { input: 5,    cache_read: 0.50, cache_5m: 6.25,  cache_1h: 10,   output: 25   },
+  'claude-opus-4-5':   { input: 5,    cache_read: 0.50, cache_5m: 6.25,  cache_1h: 10,   output: 25   },
+  // Opus 4.1 / 4
+  'claude-opus-4-1':   { input: 15,   cache_read: 1.50, cache_5m: 18.75, cache_1h: 30,   output: 75   },
+  'claude-opus-4-20250514': { input: 15, cache_read: 1.50, cache_5m: 18.75, cache_1h: 30, output: 75  },
+  // Sonnet 4.x
+  'claude-sonnet-4-6': { input: 3,    cache_read: 0.30, cache_5m: 3.75,  cache_1h: 6,    output: 15   },
+  'claude-sonnet-4-5-20241022': { input: 3, cache_read: 0.30, cache_5m: 3.75, cache_1h: 6, output: 15 },
+  'claude-sonnet-4-20250514': { input: 3, cache_read: 0.30, cache_5m: 3.75, cache_1h: 6, output: 15   },
+  // Haiku
+  'claude-haiku-4-5-20251001': { input: 1, cache_read: 0.10, cache_5m: 1.25, cache_1h: 2, output: 5   },
+  'claude-haiku-3-5-20241022': { input: 0.80, cache_read: 0.08, cache_5m: 1, cache_1h: 1.60, output: 4 },
+};
+// Fallback: match model prefix → pricing tier
+function _getModelPricing(model) {
+  if (!model) return MODEL_PRICING['claude-sonnet-4-6'];  // safe default
+  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+  if (model.includes('opus-4-6') || model.includes('opus-4-5')) return MODEL_PRICING['claude-opus-4-6'];
+  if (model.includes('opus-4')) return MODEL_PRICING['claude-opus-4-1'];
+  if (model.includes('sonnet')) return MODEL_PRICING['claude-sonnet-4-6'];
+  if (model.includes('haiku-4')) return MODEL_PRICING['claude-haiku-4-5-20251001'];
+  if (model.includes('haiku-3') || model.includes('haiku')) return MODEL_PRICING['claude-haiku-3-5-20241022'];
+  return MODEL_PRICING['claude-sonnet-4-6'];
+}
+function _fmtCost(dollars) {
+  if (dollars < 0.005) return '$0.00';
+  if (dollars < 1) return '$' + dollars.toFixed(3);
+  return '$' + dollars.toFixed(2);
+}
+function _fmtTokens(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+
+// ── Factory gauges — fed from the same SSE stream ─────────────────────────
+const _gaugeGridModels = document.getElementById('gaugeGridModels');
+const _gaugeGridTypes = document.getElementById('gaugeGridTypes');
+const _factoryGauges = {};
+
+_factoryGauges.cacheRead = TokenGauge.create(_gaugeGridTypes, {
+  id: 'cache-read', label: 'Cache Read', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.GREEN_TO_RED,
+  stats: [
+    { label: 'Tokens', id: 'tokens', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+    { label: 'Coût/min', id: 'costmin', initial: '$0', style: 'warm' },
+  ],
+});
+
+_factoryGauges.cacheWrite5m = TokenGauge.create(_gaugeGridTypes, {
+  id: 'cache-write-5m', label: 'Cache Write (5min)', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.AMBER_MONO,
+  stats: [
+    { label: 'Tokens', id: 'tokens', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+    { label: 'Coût/min', id: 'costmin', initial: '$0', style: 'warm' },
+  ],
+});
+
+_factoryGauges.cacheWrite1h = TokenGauge.create(_gaugeGridTypes, {
+  id: 'cache-write-1h', label: 'Cache Write (1h)', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.AMBER_MONO,
+  stats: [
+    { label: 'Tokens', id: 'tokens', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+    { label: 'Coût/min', id: 'costmin', initial: '$0', style: 'warm' },
+  ],
+});
+
+_factoryGauges.output = TokenGauge.create(_gaugeGridTypes, {
+  id: 'output', label: 'Output Tokens', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.BLUE_TO_PURPLE,
+  stats: [
+    { label: 'Tokens', id: 'tokens', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'hot' },
+    { label: 'Coût/min', id: 'costmin', initial: '$0', style: 'hot' },
+  ],
+});
+
+_factoryGauges.input = TokenGauge.create(_gaugeGridTypes, {
+  id: 'input', label: 'Input Tokens', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.COOL_MONO,
+  stats: [
+    { label: 'Tokens', id: 'tokens', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+    { label: 'Coût/min', id: 'costmin', initial: '$0', style: 'warm' },
+  ],
+});
+
+// ── Per-model gauges (all token types aggregated) ─────────────────────────
+_factoryGauges.opus = TokenGauge.create(_gaugeGridModels, {
+  id: 'model-opus', label: 'Opus', unit: 'M tok/min',
+  segments: [
+    { from: 0, to: 0.25, color: '#f59e0b' }, { from: 0.25, to: 0.50, color: '#f97316' },
+    { from: 0.50, to: 0.70, color: '#ef4444' }, { from: 0.70, to: 0.85, color: '#dc2626' },
+    { from: 0.85, to: 1.00, color: '#b91c1c' },
+  ],
+  stats: [
+    { label: 'Cache read', id: 'read', initial: '0' },
+    { label: 'Cache write', id: 'write', initial: '0' },
+    { label: 'Input', id: 'input', initial: '0' },
+    { label: 'Output', id: 'output', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'hot' },
+    { label: 'Calls', id: 'calls', initial: '0' },
+  ],
+});
+
+_factoryGauges.sonnet = TokenGauge.create(_gaugeGridModels, {
+  id: 'model-sonnet', label: 'Sonnet', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.BLUE_TO_PURPLE,
+  stats: [
+    { label: 'Cache read', id: 'read', initial: '0' },
+    { label: 'Cache write', id: 'write', initial: '0' },
+    { label: 'Input', id: 'input', initial: '0' },
+    { label: 'Output', id: 'output', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+    { label: 'Calls', id: 'calls', initial: '0' },
+  ],
+});
+
+_factoryGauges.haiku = TokenGauge.create(_gaugeGridModels, {
+  id: 'model-haiku', label: 'Haiku', unit: 'M tok/min',
+  segments: TokenGauge.SEGMENTS.COOL_MONO,
+  stats: [
+    { label: 'Cache read', id: 'read', initial: '0' },
+    { label: 'Cache write', id: 'write', initial: '0' },
+    { label: 'Input', id: 'input', initial: '0' },
+    { label: 'Output', id: 'output', initial: '0' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'cool' },
+    { label: 'Calls', id: 'calls', initial: '0' },
+  ],
+});
+
+// ── API Calls gauge — call rate + cache behavior ──────────────────────────
+_factoryGauges.apiCalls = TokenGauge.create(_gaugeGridModels, {
+  id: 'api-calls', label: 'API Calls', unit: 'calls/min',
+  initialMax: 20,
+  segments: [
+    { from: 0, to: 0.30, color: '#64748b' }, { from: 0.30, to: 0.60, color: '#94a3b8' },
+    { from: 0.60, to: 0.80, color: '#e2e8f0' }, { from: 0.80, to: 1.00, color: '#f97316' },
+  ],
+  stats: [
+    { label: 'Total calls', id: 'total', initial: '0' },
+    { label: 'Cache hit rate', id: 'hitrate', initial: '—' },
+    { label: 'Avg cache read', id: 'avgread', initial: '—' },
+    { label: 'Avg cache write', id: 'avgwrite', initial: '—' },
+    { label: 'Avg output', id: 'avgout', initial: '—' },
+    { label: 'Write 5m / 1h', id: 'writeratio', initial: '—' },
+  ],
+});
+
+// ── SDK Sidequest gauge — cache hit/miss for keypoint-gen calls ────────────
+_factoryGauges.sdkSidequest = TokenGauge.create(_gaugeGridModels, {
+  id: 'sdk-sidequest', label: 'SDK Sidequest', unit: 'calls/min',
+  initialMax: 5,
+  segments: [
+    { from: 0, to: 0.30, color: '#22c55e' },
+    { from: 0.30, to: 0.60, color: '#84cc16' },
+    { from: 0.60, to: 0.80, color: '#eab308' },
+    { from: 0.80, to: 1.00, color: '#ef4444' },
+  ],
+  stats: [
+    { label: 'Total calls', id: 'total', initial: '0' },
+    { label: 'Cache hit rate', id: 'hitrate', initial: '—' },
+    { label: 'Avg cache read', id: 'avgread', initial: '—' },
+    { label: 'Cache miss (cold)', id: 'misses', initial: '0', style: 'hot' },
+    { label: 'Coût total', id: 'cost', initial: '$0.00', style: 'warm' },
+  ],
+});
+
+// Accumulators: tokens + cost per category + per model
+const _acc = {
+  cacheRead:    { tokens: 0, cost: 0 },
+  cacheWrite5m: { tokens: 0, cost: 0 },
+  cacheWrite1h: { tokens: 0, cost: 0 },
+  output:       { tokens: 0, cost: 0 },
+  input:        { tokens: 0, cost: 0 },
+  opus:         { tokens: 0, cost: 0, calls: 0, read: 0, write: 0, input: 0, output: 0 },
+  sonnet:       { tokens: 0, cost: 0, calls: 0, read: 0, write: 0, input: 0, output: 0 },
+  haiku:        { tokens: 0, cost: 0, calls: 0, read: 0, write: 0, input: 0, output: 0 },
+  calls: 0,
+  // API calls cache tracking
+  api: { calls: 0, callsWithRead: 0, totalRead: 0, totalWrite5m: 0, totalWrite1h: 0, totalOutput: 0 },
+  // SDK sidequest tracking
+  sdk: { calls: 0, hits: 0, totalRead: 0, totalCreate: 0, cost: 0 },
+};
+
+function _modelFamily(model) {
+  if (!model) return 'sonnet';
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('haiku')) return 'haiku';
+  return 'sonnet';
+}
+
+function _updateGaugeStat(gaugeKey, accKey) {
+  const g = _factoryGauges[gaugeKey], a = _acc[accKey];
+  g.stat('tokens', _fmtTokens(a.tokens));
+  g.stat('cost', _fmtCost(a.cost));
+  // Cost/min from gauge's rawTPM × price/MTok (uses last known price)
+  const r = g.read();
+  g.stat('costmin', r.raw > 0.005 ? _fmtCost(r.raw * (a._lastPrice || 0)) + '/min' : '$0');
+}
+
+// Hook into existing SSE — add factory gauge feeding with model pricing
+function _handleMetricsEvent(e, isCatchup) {
+    try {
+      const d = JSON.parse(e.data);
+      const p = _getModelPricing(d.model);
+      _acc.calls++;
+
+      // Cache read
+      const cr = d.cache_read || 0;
+      if (cr > 0) {
+        if (!isCatchup) _factoryGauges.cacheRead.push(cr);
+        _acc.cacheRead.tokens += cr;
+        _acc.cacheRead.cost += cr / 1e6 * p.cache_read;
+        _acc.cacheRead._lastPrice = p.cache_read;
+        _updateGaugeStat('cacheRead', 'cacheRead');
+      }
+
+      // Cache write 5min
+      const cw5 = d.cache_5m || d.cache_creation || 0;
+      if (cw5 > 0) {
+        if (!isCatchup) _factoryGauges.cacheWrite5m.push(cw5);
+        _acc.cacheWrite5m.tokens += cw5;
+        _acc.cacheWrite5m.cost += cw5 / 1e6 * p.cache_5m;
+        _acc.cacheWrite5m._lastPrice = p.cache_5m;
+        _updateGaugeStat('cacheWrite5m', 'cacheWrite5m');
+      }
+
+      // Cache write 1h
+      const cw1h = d.cache_1h || 0;
+      if (cw1h > 0) {
+        if (!isCatchup) _factoryGauges.cacheWrite1h.push(cw1h);
+        _acc.cacheWrite1h.tokens += cw1h;
+        _acc.cacheWrite1h.cost += cw1h / 1e6 * p.cache_1h;
+        _acc.cacheWrite1h._lastPrice = p.cache_1h;
+        _updateGaugeStat('cacheWrite1h', 'cacheWrite1h');
+      }
+
+      // Output
+      const out = d.output || 0;
+      if (out > 0) {
+        if (!isCatchup) _factoryGauges.output.push(out);
+        _acc.output.tokens += out;
+        _acc.output.cost += out / 1e6 * p.output;
+        _acc.output._lastPrice = p.output;
+        _updateGaugeStat('output', 'output');
+      }
+
+      // Input
+      const inp = d.input || 0;
+      if (inp > 0) {
+        if (!isCatchup) _factoryGauges.input.push(inp);
+        _acc.input.tokens += inp;
+        _acc.input.cost += inp / 1e6 * p.input;
+        _acc.input._lastPrice = p.input;
+        _updateGaugeStat('input', 'input');
+      }
+
+      // Per-model aggregate: sum all token types for this call
+      const family = _modelFamily(d.model);
+      const allTokens = cr + cw5 + cw1h + out + inp;
+      const callCost = (cr / 1e6 * p.cache_read) + (cw5 / 1e6 * p.cache_5m)
+                     + (cw1h / 1e6 * p.cache_1h) + (out / 1e6 * p.output)
+                     + (inp / 1e6 * p.input);
+      if (allTokens > 0) {
+        if (!isCatchup) _addCostToBucket({
+          cache_read: cr / 1e6 * p.cache_read,
+          cache_5m:  cw5 / 1e6 * p.cache_5m,
+          cache_1h:  cw1h / 1e6 * p.cache_1h,
+          output:    out / 1e6 * p.output,
+          input:     inp / 1e6 * p.input,
+        });
+        if (!isCatchup) _factoryGauges[family].push(allTokens);
+        const ma = _acc[family];
+        ma.tokens += allTokens;
+        ma.cost += callCost;
+        ma.calls++;
+        ma.read += cr;
+        ma.write += cw5 + cw1h;
+        ma.input += inp;
+        ma.output += out;
+        const mg = _factoryGauges[family];
+        mg.stat('read', _fmtTokens(ma.read));
+        mg.stat('write', _fmtTokens(ma.write));
+        mg.stat('input', _fmtTokens(ma.input));
+        mg.stat('output', _fmtTokens(ma.output));
+        mg.stat('cost', _fmtCost(ma.cost));
+        mg.stat('calls', ma.calls.toLocaleString());
+      }
+
+      // Total cost card
+      const totalCost = _acc.opus.cost + _acc.sonnet.cost + _acc.haiku.cost;
+      const totalTokens = _acc.opus.tokens + _acc.sonnet.tokens + _acc.haiku.tokens;
+      document.getElementById('totalCostValue').textContent = totalCost >= 1 ? '$' + totalCost.toFixed(2) : '$' + totalCost.toFixed(3);
+      document.getElementById('totalCostOpus').textContent = _fmtCost(_acc.opus.cost);
+      document.getElementById('totalCostSonnet').textContent = _fmtCost(_acc.sonnet.cost);
+      document.getElementById('totalCostHaiku').textContent = _fmtCost(_acc.haiku.cost);
+      document.getElementById('totalCostCalls').textContent = _acc.calls.toLocaleString();
+      document.getElementById('totalCostTokens').textContent = _fmtTokens(totalTokens);
+
+      // API Calls gauge — push 1 "token" per call to get calls/min rate
+      if (!isCatchup) _factoryGauges.apiCalls.push(1000000);  // 1M = 1 call on the gauge (unit: calls/min)
+      const api = _acc.api;
+      api.calls++;
+      if (cr > 0) api.callsWithRead++;
+      api.totalRead += cr;
+      api.totalWrite5m += cw5;
+      api.totalWrite1h += cw1h;
+      api.totalOutput += out;
+      _factoryGauges.apiCalls.stat('total', api.calls.toLocaleString());
+      _factoryGauges.apiCalls.stat('hitrate', api.calls > 0 ? Math.round(api.callsWithRead / api.calls * 100) + '%' : '—');
+      _factoryGauges.apiCalls.stat('avgread', api.calls > 0 ? _fmtTokens(Math.round(api.totalRead / api.calls)) : '—');
+      _factoryGauges.apiCalls.stat('avgwrite', api.calls > 0 ? _fmtTokens(Math.round((api.totalWrite5m + api.totalWrite1h) / api.calls)) : '—');
+      _factoryGauges.apiCalls.stat('avgout', api.calls > 0 ? _fmtTokens(Math.round(api.totalOutput / api.calls)) : '—');
+      _factoryGauges.apiCalls.stat('writeratio', (api.totalWrite5m + api.totalWrite1h) > 0
+        ? _fmtTokens(api.totalWrite5m) + ' / ' + _fmtTokens(api.totalWrite1h)
+        : '—');
+
+      // SDK Sidequest gauge — filter by source
+      const isSdk = (d.source || '').startsWith('sdk-');
+      if (isSdk) {
+        if (!isCatchup) _factoryGauges.sdkSidequest.push(1000000);
+        const sdk = _acc.sdk;
+        sdk.calls++;
+        const isHit = cr > 0;  // any cache_read = warm hit
+        if (isHit) sdk.hits++;
+        sdk.totalRead += cr;
+        sdk.totalCreate += cw5 + cw1h;
+        const sdkCost = (cr / 1e6 * p.cache_read) + (cw5 / 1e6 * p.cache_5m)
+                      + (cw1h / 1e6 * p.cache_1h) + (out / 1e6 * p.output)
+                      + (inp / 1e6 * p.input);
+        sdk.cost += sdkCost;
+        _factoryGauges.sdkSidequest.stat('total', sdk.calls.toLocaleString());
+        _factoryGauges.sdkSidequest.stat('hitrate', sdk.calls > 0
+          ? Math.round(sdk.hits / sdk.calls * 100) + '%' : '—');
+        _factoryGauges.sdkSidequest.stat('avgread', sdk.calls > 0
+          ? _fmtTokens(Math.round(sdk.totalRead / sdk.calls)) : '—');
+        _factoryGauges.sdkSidequest.stat('misses', (sdk.calls - sdk.hits).toLocaleString());
+        _factoryGauges.sdkSidequest.stat('cost', _fmtCost(sdk.cost));
+      }
+
+    } catch (_) { /* ignore malformed */ }
+  });
+}
+function _patchSSEForFactoryGauges() {
+  if (!sseSource) return;
+  sseSource.addEventListener('token', (e) => _handleMetricsEvent(e, false));
+  sseSource.addEventListener('catchup', (e) => _handleMetricsEvent(e, true));
+}
+// Patch after a short delay to ensure SSE is connected
+setTimeout(_patchSSEForFactoryGauges, 500);
+// Also re-patch on SSE reconnect
+const _origInitSSE = initSSE;
+initSSE = function() {
+  _origInitSSE();
+  setTimeout(_patchSSEForFactoryGauges, 500);
+};
+
+// ── Cost histogram — fixed 5h window, implicit progress bar ───────────────
+const HIST_BUCKET_MS = 300000;  // 5min per bar
+const HIST_MAX_BUCKETS = 60;    // 60 × 5min = 5h fixed window
+let _histChart = null;
+let _histSessionStart = Date.now();
+
+// Pre-allocate all 60 buckets (5h) — empty bars = time remaining
+const _histBuckets = Array.from({ length: HIST_MAX_BUCKETS }, (_, i) => ({
+  t: _histSessionStart + i * HIST_BUCKET_MS,
+  cache_read: 0, cache_5m: 0, cache_1h: 0, output: 0, input: 0,
+}));
+
+function _getOrCreateBucket(ts) {
+  const idx = Math.floor((ts - _histSessionStart) / HIST_BUCKET_MS);
+  if (idx < 0 || idx >= HIST_MAX_BUCKETS) return null;
+  return _histBuckets[idx];
+}
+
+function _addCostToBucket(costs) {
+  const bucket = _getOrCreateBucket(Date.now());
+  if (!bucket) return;
+  bucket.cache_read += costs.cache_read || 0;
+  bucket.cache_5m  += costs.cache_5m  || 0;
+  bucket.cache_1h  += costs.cache_1h  || 0;
+  bucket.output    += costs.output    || 0;
+  bucket.input     += costs.input     || 0;
+  _updateHistogram();
+}
+
+// Current bucket index (for progress marker)
+function _currentBucketIdx() {
+  return Math.min(Math.floor((Date.now() - _histSessionStart) / HIST_BUCKET_MS), HIST_MAX_BUCKETS - 1);
+}
+
+function _updateHistogram() {
+  const curIdx = _currentBucketIdx();
+  const labels = _histBuckets.map((b, i) => {
+    const min = Math.round((b.t - _histSessionStart) / 60000);
+    const h = Math.floor(min / 60);
+    const m = min % 60;
+    return h > 0 ? `${h}h${m ? String(m).padStart(2, '0') : ''}` : `${m}m`;
+  });
+
+  // Background colors: past/current = vivid, future = dimmed
+  const _c = (hex, i) => i <= curIdx ? hex + '80' : hex + '15';
+  const _b = (hex, i) => i <= curIdx ? hex : hex + '30';
+  const crBg = _histBuckets.map((_, i) => _c('#22c55e', i));  // cache read = green
+  const c5Bg = _histBuckets.map((_, i) => _c('#f59e0b', i));  // cache write 5m = amber
+  const c1Bg = _histBuckets.map((_, i) => _c('#f97316', i));  // cache write 1h = orange
+  const ouBg = _histBuckets.map((_, i) => _c('#8b5cf6', i));  // output = purple
+  const inBg = _histBuckets.map((_, i) => _c('#3b82f6', i));  // input = blue
+  const crBd = _histBuckets.map((_, i) => _b('#22c55e', i));
+  const c5Bd = _histBuckets.map((_, i) => _b('#f59e0b', i));
+  const c1Bd = _histBuckets.map((_, i) => _b('#f97316', i));
+  const ouBd = _histBuckets.map((_, i) => _b('#8b5cf6', i));
+  const inBd = _histBuckets.map((_, i) => _b('#3b82f6', i));
+
+  if (!_histChart) {
+    const ctx = document.getElementById('costHistogramCanvas');
+    if (!ctx) return;
+    _histChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Cache Read',     data: _histBuckets.map(b => b.cache_read), backgroundColor: crBg, borderColor: crBd, borderWidth: 1, borderRadius: 2 },
+          { label: 'Cache Write 5m', data: _histBuckets.map(b => b.cache_5m),   backgroundColor: c5Bg, borderColor: c5Bd, borderWidth: 1, borderRadius: 2 },
+          { label: 'Cache Write 1h', data: _histBuckets.map(b => b.cache_1h),   backgroundColor: c1Bg, borderColor: c1Bd, borderWidth: 1, borderRadius: 2 },
+          { label: 'Output',         data: _histBuckets.map(b => b.output),     backgroundColor: ouBg, borderColor: ouBd, borderWidth: 1, borderRadius: 2 },
+          { label: 'Input',          data: _histBuckets.map(b => b.input),       backgroundColor: inBg, borderColor: inBd, borderWidth: 1, borderRadius: 2 },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 200 },
+        plugins: {
+          legend: { display: true, position: 'top', labels: { boxWidth: 8, padding: 8, font: { size: 10 }, color: '#64748b' } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(3)}`,
+              title: (items) => items[0]?.label || '',
+            },
+          },
+        },
+        scales: {
+          x: {
+            stacked: true,
+            grid: { display: false },
+            ticks: { color: '#64748b', font: { size: 9 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+            border: { color: '#2a2d3e' },
+          },
+          y: {
+            stacked: true,
+            grid: { color: '#2a2d3e40' },
+            ticks: { color: '#64748b', font: { size: 9 }, callback: (v) => '$' + v.toFixed(2) },
+            border: { color: '#2a2d3e' },
+            beginAtZero: true,
+          },
+        },
+      },
+    });
+  } else {
+    _histChart.data.labels = labels;
+    const fields = ['cache_read', 'cache_5m', 'cache_1h', 'output', 'input'];
+    const bgs = [crBg, c5Bg, c1Bg, ouBg, inBg];
+    const bds = [crBd, c5Bd, c1Bd, ouBd, inBd];
+    for (let i = 0; i < fields.length; i++) {
+      _histChart.data.datasets[i].data = _histBuckets.map(b => b[fields[i]]);
+      _histChart.data.datasets[i].backgroundColor = bgs[i];
+      _histChart.data.datasets[i].borderColor = bds[i];
+    }
+    _histChart.update('none');
+  }
+}
+
+// Initialize full 5h histogram + advance progress cursor every 30s
+setTimeout(_updateHistogram, 600);
+setInterval(_updateHistogram, 30000);
+
+// ── Color-code token type gauge borders to match histogram legend ──────────
+const _gaugeColorMap = {
+  'cache-read':     '#22c55e',  // green
+  'cache-write-5m': '#f59e0b',  // amber
+  'cache-write-1h': '#f97316',  // orange
+  'output':         '#8b5cf6',  // purple
+  'input':          '#3b82f6',  // blue
+};
+for (const [id, color] of Object.entries(_gaugeColorMap)) {
+  const el = document.getElementById(`gauge-section-${id}`);
+  if (el) {
+    el.style.borderLeft = `4px solid ${color}`;
+  }
+}
+
+// ── Session cost persistence — flush _acc to server every 30s ─────────────
+const _sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+function _flushSessionCost() {
+  const payload = {
+    session_id: _sessionId,
+    ts: Date.now() / 1000,
+    uptime_s: Math.round((Date.now() - _histSessionStart) / 1000),
+    opus:   { tokens: _acc.opus.tokens,   cost: +_acc.opus.cost.toFixed(4),   calls: _acc.opus.calls,   read: _acc.opus.read,   write: _acc.opus.write,   input: _acc.opus.input,   output: _acc.opus.output },
+    sonnet: { tokens: _acc.sonnet.tokens, cost: +_acc.sonnet.cost.toFixed(4), calls: _acc.sonnet.calls, read: _acc.sonnet.read, write: _acc.sonnet.write, input: _acc.sonnet.input, output: _acc.sonnet.output },
+    haiku:  { tokens: _acc.haiku.tokens,  cost: +_acc.haiku.cost.toFixed(4),  calls: _acc.haiku.calls,  read: _acc.haiku.read,  write: _acc.haiku.write,  input: _acc.haiku.input,  output: _acc.haiku.output },
+    total:  { tokens: _acc.opus.tokens + _acc.sonnet.tokens + _acc.haiku.tokens,
+              cost: +( _acc.opus.cost + _acc.sonnet.cost + _acc.haiku.cost).toFixed(4),
+              calls: _acc.calls },
+  };
+  fetch('/api/session-cost', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => {});
+}
+setInterval(_flushSessionCost, 30000);
+// Also flush on page unload
+window.addEventListener('beforeunload', _flushSessionCost);
 </script>
 <div id="turn-tooltip"></div>
 </body>

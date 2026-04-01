@@ -418,6 +418,32 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "not found"}, 404)
 
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path == "/api/session-cost":
+            self._handle_session_cost()
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    def _handle_session_cost(self) -> None:
+        """Append session cost snapshot to dated JSONL."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            data = json.loads(body)
+            today = datetime.now().strftime("%Y-%m-%d")
+            cost_file = METRICS_DATA_DIR / f"cost-sessions-{today}.jsonl"
+            METRICS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            line = (json.dumps(data, separators=(",", ":")) + "\n").encode()
+            fd = os.open(str(cost_file), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, line)
+            finally:
+                os.close(fd)
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
     def _handle_sse(self) -> None:
         """Stream token metrics via Server-Sent Events.
 
@@ -438,12 +464,21 @@ class Handler(BaseHTTPRequestHandler):
 
         sock = self.request  # raw socket for unbuffered writes
 
+        # Replay existing stream data so gauges rebuild accumulators on reconnect
         pos = 0
         inode = 0
         if METRICS_STREAM.exists():
             stat = METRICS_STREAM.stat()
-            pos = stat.st_size  # start from end (only new data)
             inode = stat.st_ino
+            try:
+                with open(METRICS_STREAM) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            sock.sendall(f"event: catchup\ndata: {line}\n\n".encode())
+                    pos = f.tell()
+            except (IOError, OSError):
+                pos = stat.st_size  # fallback: skip to end
 
         last_heartbeat = time.time()
 
