@@ -130,6 +130,7 @@ nohup python3 -u lib/claude_ai_poller.py > /tmp/claude-ai-poller.log 2>&1 &
 | Cache write 1h | $6.00 (2.0x) |
 
 
+<!-- ⚠ Tout le contenu CI-DESSUS est maintenu manuellement. L'atlas ne régénère que le bloc ci-dessous. -->
 <!-- atlas:start:claude-code-dashboard -->
 ## Atlas — projet claude-code-dashboard
 <!-- generated: 2026-03-30T19:16:48Z — regenerer via: python3 generate_atlas.py --project claude-code-dashboard -->
